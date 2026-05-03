@@ -1,0 +1,1121 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tablero Capacidad & Estrategia de Proceso</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jstat/1.9.6/jstat.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        /* Se cambió el color de fondo a Teal #008080 */
+        body { font-family: 'Inter', sans-serif; background-color: #008080; color: #0f172a; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .glass-panel { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); border: 1px solid #e2e8f0; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- FUNCIONES MATEMÁTICAS Y ESTADÍSTICAS ---
+        const calcStats = (arr) => {
+            if (!arr || arr.length === 0) return { mean: 0, var: 0, std: 0, n: 0 };
+            const n = arr.length;
+            const mean = arr.reduce((a, b) => a + b, 0) / n;
+            const variance = n > 1 ? arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (n - 1) : 0;
+            return { mean, var: variance, std: Math.sqrt(variance), n };
+        };
+
+        const calcPpk = (mean, std, usl, lsl, isUnilateral) => {
+            if (std === 0 || isNaN(std) || isNaN(mean)) return 0;
+            if (isUnilateral) return (usl - mean) / (3 * std);
+            return Math.min(usl - mean, mean - lsl) / (3 * std);
+        };
+
+        const bartlettTest = (groups) => {
+            const validGroups = groups.filter(g => g && g.length > 1);
+            const k = validGroups.length;
+            if (k < 2) return 1;
+
+            const statsList = validGroups.map(g => calcStats(g));
+            const nonZeroVarStats = statsList.filter(s => s.var > 1e-10); 
+            if (nonZeroVarStats.length === 0) return 1; 
+            if (nonZeroVarStats.length < k) return 0;   
+
+            let N = 0, sum_num = 0, sum_den_1 = 0, sum_inv_df = 0;
+
+            for (let i = 0; i < k; i++) {
+                const stats = statsList[i];
+                const df = stats.n - 1;
+                N += stats.n;
+                sum_num += df * stats.var;
+                sum_den_1 += df * Math.log(stats.var);
+                sum_inv_df += 1 / df;
+            }
+
+            if (N - k <= 0) return 1;
+
+            const Sp2 = sum_num / (N - k);
+            const T = (N - k) * Math.log(Sp2) - sum_den_1;
+            const C = 1 + (1 / (3 * (k - 1))) * (sum_inv_df - (1 / (N - k)));
+            const chiSquareStat = T / C;
+            
+            const pValue = 1 - jStat.chisquare.cdf(chiSquareStat, k - 1);
+            return isNaN(pValue) ? 1 : Math.max(0, pValue);
+        };
+
+        const extractGroupName = (colName) => colName.trim();
+
+        const getTargetPpk = (categoria) => {
+            const cat = (categoria || "").toLowerCase();
+            if (cat.includes("ctq")) return 1.33;
+            if (cat.includes("dva") || cat.includes("apariencia")) return 1.0;
+            return 0.8; // Default para CP
+        };
+
+        // --- PROCESAMIENTO DEL CSV ---
+        const processData = (parsedData) => {
+            let headerIdx = -1;
+            for (let i = 0; i < Math.min(10, parsedData.length); i++) {
+                const row = parsedData[i];
+                if (row.some(c => c && typeof c === 'string' && c.trim().toLowerCase() === 'dimension')) {
+                    headerIdx = i;
+                    break;
+                }
+            }
+            if (headerIdx === -1) throw new Error("No se encontró la fila de encabezados con 'Dimension'.");
+
+            let extractedPartInfo = "";
+            for (let i = 0; i < headerIdx; i++) {
+                const textCells = parsedData[i].filter(c => c && typeof c === 'string' && c.trim().length > 0);
+                if (textCells.length > 0) {
+                    extractedPartInfo = textCells.join(" | ");
+                    break;
+                }
+            }
+
+            const headers = parsedData[headerIdx].map(h => h ? h.trim() : '');
+            const rawRows = parsedData.slice(headerIdx + 1).filter(r => r[0]);
+
+            const colIdx = {
+                dimension: headers.findIndex(h => h.toLowerCase() === 'dimension'),
+                categoria: headers.findIndex(h => h.toLowerCase().includes('categoria') || h.toLowerCase().includes('zona')),
+                espec: headers.findIndex(h => h.toLowerCase().includes('espec.') || h.toLowerCase() === 'espec'),
+                tolSup: headers.findIndex(h => h.toLowerCase().includes('tol. sup')),
+                tolInf: headers.findIndex(h => h.toLowerCase().includes('tol. inf'))
+            };
+
+            const measurementCols = [];
+            headers.forEach((h, i) => {
+                if (i > Math.max(...Object.values(colIdx)) && h !== "") {
+                    measurementCols.push({ index: i, name: h, group: extractGroupName(h) });
+                }
+            });
+
+            const processedRows = rawRows.map((row, rowId) => {
+                const dimension = row[colIdx.dimension];
+                
+                let categoria = colIdx.categoria >= 0 ? row[colIdx.categoria].trim() : "CP";
+                if (!categoria) categoria = "CP";
+
+                const espec = parseFloat(row[colIdx.espec]) || 0;
+                let tSup = parseFloat(row[colIdx.tolSup]) || 0;
+                let tInf = parseFloat(row[colIdx.tolInf]) || 0;
+                
+                let rawLsl = espec + tInf;
+                if (tInf > 0 && !row[colIdx.tolInf].toString().trim().startsWith('-')) {
+                    rawLsl = espec - tInf;
+                }
+                
+                const calcUsl = espec + tSup;
+                const usl = Math.max(calcUsl, rawLsl);
+                const lsl = Math.min(calcUsl, rawLsl);
+
+                const isUnilateral = (tInf === 0 && lsl === espec);
+                const targetPpk = getTargetPpk(categoria);
+
+                const groups = {};
+                let allValues = [];
+                
+                measurementCols.forEach(mCol => {
+                    const val = parseFloat(row[mCol.index]);
+                    if (!isNaN(val)) { 
+                        if (!groups[mCol.group]) groups[mCol.group] = [];
+                        groups[mCol.group].push(val);
+                        allValues.push(val);
+                    }
+                });
+
+                const globalStats = calcStats(allValues);
+                const globalPpk = calcPpk(globalStats.mean, globalStats.std, usl, lsl, isUnilateral);
+                const actRango = usl - lsl;
+                const idr = Math.abs(actRango) > 0 ? (Math.abs(globalStats.mean - espec) / Math.abs(actRango)) * 100 : 0;
+
+                const moldesData = Object.keys(groups).map(gName => {
+                    const groupArr = groups[gName];
+                    const restArr = allValues.filter((_, i) => !groupArr.includes(allValues[i])); 
+                    const gStats = calcStats(groupArr);
+                    const pValue = bartlettTest([groupArr, restArr]);
+                    const isStable = pValue >= 0.05;
+                    const ppk = calcPpk(gStats.mean, gStats.std, usl, lsl, isUnilateral);
+                    const moldIdr = Math.abs(actRango) > 0 ? (Math.abs(gStats.mean - espec) / Math.abs(actRango)) * 100 : 0;
+
+                    return { name: gName, values: groupArr, stats: gStats, pValue, isStable, ppk, idr: moldIdr };
+                });
+
+                const stableMolds = moldesData.filter(m => m.isStable);
+                let pooledSigma = globalStats.std;
+                if (stableMolds.length > 0) {
+                    let sumNum = 0, sumDen = 0;
+                    stableMolds.forEach(m => {
+                        sumNum += (m.stats.n - 1) * m.stats.var;
+                        sumDen += (m.stats.n - 1);
+                    });
+                    pooledSigma = sumDen > 0 ? Math.sqrt(sumNum / sumDen) : globalStats.std;
+                }
+
+                const propUsl = espec + (3 * pooledSigma);
+                const propLsl = espec - (3 * pooledSigma);
+                const propRango = propUsl - propLsl;
+                const projPpk = calcPpk(globalStats.mean, pooledSigma, usl, lsl, isUnilateral);
+                
+                let redefStrategy = "Mantener";
+                if (projPpk >= targetPpk && globalPpk < targetPpk) redefStrategy = "Centrar Proceso";
+                else if (projPpk < targetPpk) redefStrategy = "Redefinir Tolerancia";
+                else if (globalPpk >= targetPpk) redefStrategy = "Consolidar";
+
+                return {
+                    id: rowId, dimension, categoria, targetPpk, espec, usl, lsl, actRango, isUnilateral,
+                    globalStats, globalPpk, idr, moldesData,
+                    pooledSigma, propUsl, propLsl, propRango, projPpk, redefStrategy
+                };
+            });
+
+            return { processedRows, extractedPartInfo };
+        };
+
+        // --- COMPONENTES UI ---
+        const CardKPI = ({ title, value, sub, colorClass="text-teal-600" }) => (
+            <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">{title}</h3>
+                <div className={`text-2xl font-black ${colorClass}`}>{value}</div>
+                {sub && <div className="text-xs text-slate-400 mt-1 font-medium">{sub}</div>}
+            </div>
+        );
+
+        const ResumenView = ({ data }) => {
+            if(data.length === 0) return null;
+            const moldsList = data[0].moldesData.map(m => m.name);
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                        <div className="p-4 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+                            <h2 className="font-bold text-slate-700">Matriz de Homogeneidad y Capacidad</h2>
+                            <div className="flex gap-4 text-xs font-semibold">
+                                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-emerald-400"></span> Varianza Estable</span>
+                                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-full bg-rose-400"></span> Varianza Inestable</span>
+                            </div>
+                        </div>
+                        <div className="overflow-x-auto custom-scrollbar" style={{maxHeight: '2500px'}}>
+                            <table className="w-full text-sm text-left">
+                                <thead className="text-xs text-slate-500 bg-white sticky top-0 shadow-sm z-10">
+                                    <tr>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200">Dimensión</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Categoría</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Ppk Global</th>
+                                        {moldsList.map(m => (
+                                            <th key={m} className="px-4 py-3 font-bold border-b border-slate-200 text-center">{m}</th>
+                                        ))}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {data.map((row, idx) => (
+                                        <tr key={idx} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                                            <td className="px-4 py-3 font-medium text-slate-800">{row.dimension}</td>
+                                            <td className="px-4 py-3 text-center">
+                                                <span className="px-2 py-1 bg-slate-100 text-slate-600 rounded-lg text-[10px] font-bold uppercase whitespace-nowrap">{row.categoria}</span>
+                                            </td>
+                                            <td className="px-4 py-3 text-center">
+                                                <span className={`font-bold ${row.globalPpk >= row.targetPpk ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                    {row.globalPpk.toFixed(3)}
+                                                </span>
+                                            </td>
+                                            {row.moldesData.map((m, mIdx) => (
+                                                <td key={mIdx} className="px-4 py-3 text-center">
+                                                    <div className="flex flex-col items-center justify-center gap-1">
+                                                        <div className={`w-3.5 h-3.5 rounded-full shadow-sm ${m.isStable ? 'bg-emerald-400' : 'bg-rose-400'}`} title={`p-value: ${m.pValue.toFixed(4)}`}></div>
+                                                        <span className="text-[10px] text-slate-400 font-medium">{m.ppk.toFixed(3)}</span>
+                                                    </div>
+                                                </td>
+                                            ))}
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const EstrategiaView = ({ data, activeTargetPpk }) => {
+            const plotDiv1 = useRef(null);
+            const plotDiv2 = useRef(null);
+
+            useEffect(() => {
+                if(!data || data.length === 0 || !plotDiv1.current || !plotDiv2.current) return;
+
+                const moldsObj = {};
+                data[0].moldesData.forEach(m => {
+                    moldsObj[m.name] = { ppkSum: 0, stableCount: 0, total: 0 };
+                });
+
+                data.forEach(d => {
+                    d.moldesData.forEach(m => {
+                        if(moldsObj[m.name]) {
+                            moldsObj[m.name].ppkSum += m.ppk;
+                            if(m.isStable) moldsObj[m.name].stableCount++;
+                            moldsObj[m.name].total++;
+                        }
+                    });
+                });
+
+                const moldNames = Object.keys(moldsObj);
+                const moldPpks = moldNames.map(m => moldsObj[m].ppkSum / moldsObj[m].total);
+                const moldStablePct = moldNames.map(m => (moldsObj[m].stableCount / moldsObj[m].total) * 100);
+
+                const trace1 = {
+                    x: moldNames, y: moldPpks,
+                    type: 'bar', name: 'Ppk Promedio',
+                    marker: { color: '#008080', opacity: 0.8, line: { color: '#006666', width: 1 } },
+                    yaxis: 'y1'
+                };
+                
+                const trace2 = {
+                    x: moldNames, y: moldStablePct,
+                    type: 'scatter', mode: 'lines+markers', name: '% Estabilidad',
+                    marker: { color: '#10b981', size: 10, line: { color: '#ffffff', width: 2 } },
+                    line: { color: '#10b981', width: 3, shape: 'spline' },
+                    yaxis: 'y2'
+                };
+
+                const layout1 = {
+                    title: { text: 'Rendimiento Promedio por Molde', font: { size: 14, family: 'Inter', color: '#1e293b' } },
+                    margin: { t: 40, l: 50, r: 50, b: 60 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    legend: { orientation: 'h', x: 0.5, y: -0.2, xanchor: 'center' },
+                    xaxis: { title: '', tickangle: -45, gridcolor: '#f1f5f9' },
+                    yaxis: { title: 'Ppk Promedio', gridcolor: '#e2e8f0', zerolinecolor: '#cbd5e1' },
+                    yaxis2: { 
+                        title: '% Estabilidad Varianza', overlaying: 'y', side: 'right', 
+                        range: [0, 110], gridcolor: 'rgba(0,0,0,0)',
+                        tickfont: { color: '#10b981' }, titlefont: { color: '#10b981' }
+                    }
+                };
+
+                Plotly.newPlot(plotDiv1.current, [trace1, trace2], layout1, {responsive: true, displayModeBar: false});
+
+                const subgroups = data[0].moldesData.map(m => m.name);
+                const COLORS = ['#008080','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16', '#64748b'];
+                
+                let allX = [];
+                let allY = [];
+
+                const tracesScatter = subgroups.map((sg, i) => {
+                    const scatterX = [];
+                    const scatterY = [];
+                    const texts = [];
+
+                    data.forEach(d => {
+                        const mData = d.moldesData.find(m => m.name === sg);
+                        if (mData) {
+                            scatterX.push(mData.idr);
+                            scatterY.push(mData.ppk);
+                            allX.push(mData.idr);
+                            allY.push(mData.ppk);
+                            
+                            const hoverText = '<b>' + d.dimension + '</b><br>' +
+                                              'Molde: ' + mData.name + '<br>' +
+                                              'Categoría: ' + d.categoria + '<br>' +
+                                              'IDR: ' + mData.idr.toFixed(2) + '%<br>' +
+                                              'Ppk: ' + mData.ppk.toFixed(3);
+                            texts.push(hoverText);
+                        }
+                    });
+
+                    return {
+                        x: scatterX, y: scatterY, text: texts,
+                        mode: 'markers', type: 'scatter', name: sg,
+                        marker: { size: 10, color: COLORS[i % COLORS.length], opacity: 0.85, line: {width: 1, color: '#ffffff'} },
+                        hoverinfo: 'text',
+                        hovertemplate: '%{text}<extra></extra>'
+                    };
+                });
+
+                const maxX = 300;
+                const minPpkY = -3;
+                const maxPpkY = 3;
+                
+                const targetIDR = 50;
+
+                const layout2 = {
+                    title: { text: `Mapa Estratégico de Moldes (Meta Dinámica: ${activeTargetPpk})`, font: { size: 14, family: 'Inter', color: '#1e293b' } },
+                    margin: { t: 40, l: 50, r: 120, b: 50 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    xaxis: { title: 'IDR: Desplazamiento Relativo (% de Tolerancia)', range: [0, maxX], gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    yaxis: { title: 'Ppk Operativo Individual', range: [minPpkY, maxPpkY], gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    showlegend: true,
+                    legend: { orientation: 'v', x: 1.02, y: 1, bordercolor: '#e2e8f0', borderwidth: 1, borderpad: 5, font: { size: 11, family: 'Inter' }, bgcolor: 'rgba(255,255,255,0.8)' },
+                    shapes: [
+                        { type: 'rect', xref: 'x', yref: 'y', x0: 0, x1: targetIDR, y0: activeTargetPpk, y1: maxPpkY, fillcolor: 'rgba(16, 185, 129, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: 0, x1: targetIDR, y0: minPpkY, y1: activeTargetPpk, fillcolor: 'rgba(234, 179, 8, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: targetIDR, x1: maxX, y0: minPpkY, y1: activeTargetPpk, fillcolor: 'rgba(239, 68, 68, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'rect', xref: 'x', yref: 'y', x0: targetIDR, x1: maxX, y0: activeTargetPpk, y1: maxPpkY, fillcolor: 'rgba(249, 115, 22, 0.1)', line: { width: 0 }, layer: 'below' },
+                        { type: 'line', xref: 'x', yref: 'y', x0: 0, x1: maxX, y0: activeTargetPpk, y1: activeTargetPpk, line: { color: '#334155', width: 1.5, dash: 'dash' } },
+                        { type: 'line', xref: 'x', yref: 'y', x0: targetIDR, x1: targetIDR, y0: minPpkY, y1: maxPpkY, line: { color: '#334155', width: 1.5, dash: 'dash' } }
+                    ],
+                    annotations: [
+                        { x: 25, y: maxPpkY, xref: 'x', yref: 'y', text: '<b>CAPACIDAD IDEAL</b>', showarrow: false, font: { color: '#059669', size: 10 }, xanchor: 'center', yanchor: 'top', yshift: -10 },
+                        { x: 25, y: minPpkY, xref: 'x', yref: 'y', text: '<b>ALTA VARIANZA</b>', showarrow: false, font: { color: '#ca8a04', size: 10 }, xanchor: 'center', yanchor: 'bottom', yshift: 10 },
+                        { x: targetIDR + (maxX - targetIDR)/2, y: minPpkY, xref: 'x', yref: 'y', text: '<b>ESTADO CRÍTICO</b>', showarrow: false, font: { color: '#dc2626', size: 10 }, xanchor: 'center', yanchor: 'bottom', yshift: 10 },
+                        { x: targetIDR + (maxX - targetIDR)/2, y: maxPpkY, xref: 'x', yref: 'y', text: '<b>PROCESO CAPAZ, REQUIERE CENTRAR</b>', showarrow: false, font: { color: '#ea580c', size: 10 }, xanchor: 'center', yanchor: 'top', yshift: -10 }
+                    ]
+                };
+
+                Plotly.newPlot(plotDiv2.current, tracesScatter, layout2, {responsive: true, displayModeBar: false});
+            }, [data, activeTargetPpk]);
+
+            // --- FUNCIÓN PARA EXPORTAR LA TABLA A EXCEL/CSV ---
+            const exportToExcel = () => {
+                const exportData = data.map(row => {
+                    const tolActual = `+/- ${(row.actRango / 2).toFixed(3)}`;
+                    const tolPropuesta = `+/- ${(row.propRango / 2).toFixed(3)}`;
+                    
+                    let deltaTolPct = 0;
+                    if (row.actRango > 0) {
+                        deltaTolPct = ((row.propRango - row.actRango) / row.actRango) * 100;
+                    }
+                    const deltaTolStr = (deltaTolPct > 0 ? '+' : '') + deltaTolPct.toFixed(1) + '%';
+
+                    const stdGlobal = row.globalStats.std;
+                    const ppProyectado = (row.propRango > 0 && stdGlobal > 0) ? (row.propRango / (6 * stdGlobal)) : 0;
+                    const ppkProyectado = (stdGlobal > 0) ? Math.min(row.propUsl - row.globalStats.mean, row.globalStats.mean - row.propLsl) / (3 * stdGlobal) : 0;
+                        
+                    let finalStrategy = row.redefStrategy;
+                    if (finalStrategy === 'Redefinir Tolerancia' && (ppProyectado - ppkProyectado) > 0.3) {
+                        finalStrategy = 'REDEFINIR TOLERANCIA, CENTRAR';
+                    }
+
+                    return {
+                        'Dimensión': row.dimension,
+                        'Tolerancias Actuales': tolActual,
+                        'Ppk Actual': row.globalPpk.toFixed(3),
+                        'Desv. Std Global': stdGlobal.toFixed(4),
+                        'Tolerancias Propuestas': tolPropuesta,
+                        'Delta Tolerancia': deltaTolStr,
+                        'PP Proyectado': ppProyectado.toFixed(3),
+                        'PPk Proyectado': ppkProyectado.toFixed(3),
+                        'Estrategia': finalStrategy
+                    };
+                });
+
+                // Convertir JSON a formato CSV usando PapaParse
+                const csv = Papa.unparse(exportData);
+                
+                // Agregar BOM (\uFEFF) para que Excel reconozca correctamente los caracteres UTF-8 (acentos)
+                const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                
+                // Crear un enlace temporal para forzar la descarga
+                const link = document.createElement('a');
+                link.setAttribute('href', url);
+                link.setAttribute('download', 'Matriz_de_Especificaciones.csv');
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const totalDims = data.length;
+            const capaces = data.filter(d => d.globalPpk >= d.targetPpk).length;
+            const pctCapaz = ((capaces / totalDims) * 100) || 0;
+            let totalMolds = 0, stableMolds = 0;
+            
+            data.forEach(d => d.moldesData.forEach(m => {
+                totalMolds++;
+                if(m.isStable) stableMolds++;
+            }));
+            const pctEstable = ((stableMolds / totalMolds) * 100) || 0;
+            const opps = data.filter(d => d.redefStrategy === 'Redefinir Tolerancia' || d.redefStrategy === 'REDEFINIR TOLERANCIA, CENTRAR').length;
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <CardKPI title="CTQs Analizados" value={totalDims} colorClass="text-slate-800" />
+                        <CardKPI title="% Capaces Global" value={`${pctCapaz.toFixed(1)}%`} colorClass={pctCapaz > 80 ? "text-emerald-600" : "text-amber-500"} />
+                        <CardKPI title="% Estabilidad Total" value={`${pctEstable.toFixed(1)}%`} colorClass={pctEstable > 90 ? "text-teal-600" : "text-amber-500"} />
+                        <CardKPI title="Oportunidades Specs" value={opps} sub="Requieren ampliación/centrado" colorClass="text-purple-600" />
+                    </div>
+
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <div ref={plotDiv1} className="w-full h-[450px]"></div>
+                        </div>
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <div ref={plotDiv2} className="w-full h-[450px]"></div>
+                        </div>
+                    </div>
+
+                    {/* Matriz de Redefinición de Especificaciones */}
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mt-8">
+                        <div className="p-4 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+                            <div>
+                                <h2 className="font-bold text-slate-700">Matriz de Redefinición de Especificaciones</h2>
+                                <p className="text-xs text-slate-500 mt-1 font-medium">Nota: La proyeccion de PP, considera la variación actual de todos los moldes estables / NO estables.</p>
+                            </div>
+                            
+                            {/* Botón Exportar a Excel */}
+                            <button 
+                                onClick={exportToExcel}
+                                className="flex items-center gap-2 px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm"
+                            >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                                </svg>
+                                Descargar Excel (CSV)
+                            </button>
+                        </div>
+                        <div className="overflow-x-auto custom-scrollbar" style={{maxHeight: '500px'}}>
+                            <table className="w-full text-sm text-left">
+                                <thead className="text-xs text-slate-500 bg-white sticky top-0 shadow-sm z-10">
+                                    <tr>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200">Dimensión</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Tolerancias Actuales</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Ppk Actual</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center" title="Desviación Estándar de todos los moldes">Desv. Std Global</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Tolerancias Propuestas</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Delta Tolerancia</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center bg-purple-50" title="PP Proyectado (Media Centrada) = (USL Prop. - LSL Prop.) / (6 * Desv Std Global)">PP Proyectado</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center bg-indigo-50" title="PPk Proyectado usando Desv Std Global">PPk Proyectado</th>
+                                        <th className="px-4 py-3 font-bold border-b border-slate-200 text-center">Estrategia</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {data.map((row, idx) => {
+                                        const tolActual = `+/- ${(row.actRango / 2).toFixed(3)}`;
+                                        const tolPropuesta = `+/- ${(row.propRango / 2).toFixed(3)}`;
+                                        
+                                        let deltaTolPct = 0;
+                                        if (row.actRango > 0) {
+                                            deltaTolPct = ((row.propRango - row.actRango) / row.actRango) * 100;
+                                        }
+                                        const deltaTolStr = (deltaTolPct > 0 ? '+' : '') + deltaTolPct.toFixed(1) + '%';
+
+                                        const stdGlobal = row.globalStats.std;
+                                        const ppProyectado = (row.propRango > 0 && stdGlobal > 0) 
+                                            ? (row.propRango / (6 * stdGlobal)) 
+                                            : 0;
+                                        const ppkProyectado = (stdGlobal > 0)
+                                            ? Math.min(row.propUsl - row.globalStats.mean, row.globalStats.mean - row.propLsl) / (3 * stdGlobal)
+                                            : 0;
+                                            
+                                        let finalStrategy = row.redefStrategy;
+                                        if (finalStrategy === 'Redefinir Tolerancia' && (ppProyectado - ppkProyectado) > 0.3) {
+                                            finalStrategy = 'REDEFINIR TOLERANCIA, CENTRAR';
+                                        }
+
+                                        return (
+                                            <tr key={idx} className="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+                                                <td className="px-4 py-3 font-medium text-slate-800">{row.dimension}</td>
+                                                <td className="px-4 py-3 text-center text-slate-600 font-mono text-xs">{tolActual}</td>
+                                                <td className="px-4 py-3 text-center font-bold text-slate-700">{row.globalPpk.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center text-slate-600">{stdGlobal.toFixed(4)}</td>
+                                                <td className="px-4 py-3 text-center text-teal-600 font-mono text-xs font-semibold">{tolPropuesta}</td>
+                                                <td className={`px-4 py-3 text-center font-bold text-xs ${deltaTolPct > 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                                                    {deltaTolStr}
+                                                </td>
+                                                <td className="px-4 py-3 text-center font-black text-purple-600 bg-purple-50/30">{ppProyectado.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center font-black text-indigo-600 bg-indigo-50/30">{ppkProyectado.toFixed(3)}</td>
+                                                <td className="px-4 py-3 text-center">
+                                                    <span className={`px-2 py-1 rounded-lg text-[10px] font-bold uppercase whitespace-nowrap ${
+                                                        finalStrategy === 'Mantener' ? 'bg-slate-100 text-slate-600' :
+                                                        finalStrategy === 'Centrar Proceso' ? 'bg-teal-100 text-teal-700' :
+                                                        finalStrategy === 'Consolidar' ? 'bg-emerald-100 text-emerald-700' :
+                                                        finalStrategy === 'REDEFINIR TOLERANCIA, CENTRAR' ? 'bg-orange-100 text-orange-700' :
+                                                        'bg-rose-100 text-rose-600'
+                                                    }`}>
+                                                        {finalStrategy}
+                                                    </span>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const DetalleView = ({ data }) => {
+            const [selectedId, setSelectedId] = useState(data[0]?.id || 0);
+            const plotDiv = useRef(null);
+
+            useEffect(() => {
+                if(!data.find(d => d.id === selectedId)) {
+                    setSelectedId(data[0]?.id || 0);
+                }
+            }, [data]);
+
+            const item = data.find(d => d.id === selectedId) || data[0];
+
+            useEffect(() => {
+                if(!item || !plotDiv.current) return;
+                const traces = [];
+                item.moldesData.forEach(m => {
+                    traces.push({
+                        y: m.values, type: 'box', name: m.name, boxpoints: 'all', jitter: 0.5, pointpos: 0,
+                        marker: { color: m.isStable ? '#008080' : '#f43f5e', size: 4, opacity: 0.6 },
+                        line: { color: m.isStable ? '#004d4d' : '#be123c', width: 1 }
+                    });
+                });
+
+                const layout = {
+                    title: { text: `Distribución de Mediciones: ${item.dimension}`, font: { size: 14, family: 'Inter' } },
+                    margin: { t: 40, l: 40, r: 40, b: 40 },
+                    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                    showlegend: false,
+                    yaxis: { title: 'Milímetros', gridcolor: '#f1f5f9', zerolinecolor: '#cbd5e1' },
+                    shapes: [
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.usl, y1: item.usl, line: { color: '#ef4444', width: 2, dash: 'dash' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.lsl, y1: item.lsl, line: { color: '#ef4444', width: 2, dash: 'dash' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.propUsl, y1: item.propUsl, line: { color: '#008080', width: 2, dash: 'dot' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.propLsl, y1: item.propLsl, line: { color: '#008080', width: 2, dash: 'dot' } },
+                        { type: 'line', x0: -0.5, x1: item.moldesData.length - 0.5, y0: item.espec, y1: item.espec, line: { color: '#000000', width: 1, dash: 'dot' } }
+                    ]
+                };
+
+                Plotly.newPlot(plotDiv.current, traces, layout, {responsive: true, displayModeBar: false});
+            }, [item]);
+
+            if(!item) return null;
+
+            const globalDesvNominal = item.globalStats.mean - item.espec;
+
+            return (
+                <div className="space-y-6 mt-6">
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 flex flex-col md:flex-row gap-4 items-center">
+                        <label className="text-sm font-bold text-slate-700 whitespace-nowrap">Seleccionar Dimensión:</label>
+                        <select 
+                            className="w-full bg-slate-50 border border-slate-200 text-sm rounded-lg px-4 py-2 focus:ring-2 focus:ring-teal-500 outline-none transition-all"
+                            value={selectedId} onChange={(e) => setSelectedId(parseInt(e.target.value))}
+                        >
+                            {data.map(d => (
+                                <option key={d.id} value={d.id}>{d.dimension}</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <h3 className="text-sm font-bold text-slate-700 mb-3 border-b border-slate-100 pb-2">Métricas Globales</h3>
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">PPk Global</p>
+                                    <p className={`text-lg font-black ${item.globalPpk >= item.targetPpk ? 'text-emerald-600' : 'text-rose-600'}`}>{item.globalPpk.toFixed(3)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Promedio Real</p>
+                                    <p className="text-lg font-bold text-slate-700">{item.globalStats.mean.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Desv. vs Nominal</p>
+                                    <p className="text-lg font-bold text-slate-700">{globalDesvNominal > 0 ? '+' : ''}{globalDesvNominal.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Desviación (Sigma)</p>
+                                    <p className="text-lg font-bold text-slate-700">{item.globalStats.std.toFixed(4)}</p>
+                                </div>
+                                <div className="bg-teal-50/50 p-2.5 rounded-xl border border-teal-100">
+                                    <p className="text-[10px] text-teal-700 font-bold uppercase tracking-wide">Desv. Pooled</p>
+                                    <p className="text-lg font-black text-teal-800">{item.pooledSigma.toFixed(4)}</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                            <h3 className="text-sm font-bold text-slate-700 mb-3 border-b border-slate-100 pb-2">Specs & Tolerancias</h3>
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Nominal</p>
+                                    <p className="text-xl font-black text-slate-800">{item.espec.toFixed(3)}</p>
+                                </div>
+                                <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Tol. Actuales</p>
+                                    <p className="text-lg font-bold text-slate-600">+/- {(item.actRango / 2).toFixed(3)}</p>
+                                </div>
+                                <div className="bg-purple-50 p-2.5 rounded-xl border border-purple-100 shadow-sm">
+                                    <p className="text-[10px] text-purple-600 font-bold uppercase tracking-wide">Tol. Propuestas</p>
+                                    <p className="text-lg font-black text-purple-700">+/- {(item.propRango / 2).toFixed(3)}</p>
+                                </div>
+                            </div>
+                            <div className="mt-3 flex items-center gap-4 text-xs font-medium text-slate-500">
+                                <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-rose-500 block"></span> Límites Actuales</span>
+                                <span className="flex items-center gap-1"><span className="w-4 h-0.5 bg-teal-600 block border-b border-dotted border-teal-600"></span> Límites Propuestos</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                        <div ref={plotDiv} className="w-full h-[500px]"></div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                        {item.moldesData.map((m, idx) => {
+                            const desviacion = m.stats.mean - item.espec;
+                            
+                            const cardStyle = m.isStable 
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-900' 
+                                : 'bg-rose-50 border-rose-200 text-rose-900';
+                            
+                            const badgeStyle = m.isStable
+                                ? 'bg-emerald-200/60 text-emerald-800'
+                                : 'bg-rose-200/60 text-rose-800';
+
+                            const itemBgStyle = m.isStable
+                                ? 'bg-emerald-100/50'
+                                : 'bg-rose-100/50';
+
+                            return (
+                                <div key={idx} className={`p-4 rounded-xl shadow-sm border hover:shadow-md transition-shadow ${cardStyle}`}>
+                                    <div className="flex justify-between items-center mb-3 border-b border-black/5 pb-2">
+                                        <h4 className="font-bold text-sm truncate" title={m.name}>{m.name}</h4>
+                                        <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold ${badgeStyle}`}>
+                                            <div className={`w-1.5 h-1.5 rounded-full ${m.isStable ? 'bg-emerald-500' : 'bg-rose-500'}`}></div>
+                                            {m.isStable ? 'Homogéneo' : 'No Homogéneo'}
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <div className={`flex justify-between items-center p-2 rounded-lg ${itemBgStyle}`}>
+                                            <span className="text-[11px] font-bold uppercase tracking-wider opacity-70">PPk</span>
+                                            <span className="text-sm font-black">{m.ppk.toFixed(3)}</span>
+                                        </div>
+                                        <div className={`flex justify-between items-center p-2 rounded-lg ${itemBgStyle}`}>
+                                            <span className="text-[11px] font-bold uppercase tracking-wider opacity-70" title="Media - Valor Nominal">Desv. vs Nominal</span>
+                                            <span className="text-sm font-bold">
+                                                {desviacion > 0 ? '+' : ''}{desviacion.toFixed(4)}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [rawData, setRawData] = useState(null);
+            const [activeTab, setActiveTab] = useState('resumen');
+            const [filterCat, setFilterCat] = useState('Todas');
+            const [partInfo, setPartInfo] = useState('');
+
+            // =========================================================================
+            // AQUÍ VA TU ARCHIVO CSV. PEGA TODO EL CONTENIDO ENTRE LAS COMILLAS INVERTIDAS
+            // =========================================================================
+            const embeddedCsvData = `,No de parte,294D3446G001,,,Descripción,GABINETE  36 SD LH,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+Dimension,Categoria,Espec.,Tol. Sup.,Tol. Inf.,M1-EST 9,M1-EST 9,M1-EST 9,M1-EST 9,M1-EST 9,M2-EST 15,M2-EST 15,M2-EST 15,M2-EST 15,M3-EST 11,M3-EST 11,M3-EST 11,M3-EST 11,M3-EST 11,M4-EST 10,M4-EST 10,M4-EST 10,M4-EST 10,M4-EST 10,M5-EST 13,M5-EST 13,M5-EST 13,M5-EST 13,M6-EST 14,M6-EST 14,M6-EST 14,M6-EST 14,M7-EST 16,M7-EST 16,M7-EST 16,M7-EST 16,M8-EST 12,M8-EST 12,M8-EST 12,M8-EST 12,M8-EST 12
+[CP] LIN 1. Ancho total frente arriba- 35.76,CP,35.76,0.06,0.06,35.725,35.728,35.728,35.73,35.74,35.723,35.741,35.736,35.741,35.738,35.735,35.738,35.74,35.753,35.743,35.739,35.747,35.742,35.75,35.733,35.726,35.721,35.723,35.712,35.705,35.693,35.723,35.763,35.705,35.737,35.747,35.737,35.725,35.728,35.734,35.744
+[CP] LIN 2. Ancho total frente medio- 35.76,CP,35.76,0.06,0.06,35.702,35.685,35.759,35.757,35.81,35.685,35.772,35.781,35.772,35.745,35.764,35.87,35.816,35.861,35.741,35.763,35.787,35.774,35.826,35.711,35.838,35.855,35.834,35.571,35.679,35.712,35.829,35.847,35.679,35.896,35.895,35.801,35.893,35.876,35.863,35.902
+[CP] LIN 3. Ancho total frente abajo- 35.76,CP,35.76,0.06,0.06,35.78,35.734,35.742,35.754,35.753,35.76,35.768,35.74,35.768,35.754,35.735,35.694,35.737,35.727,35.778,35.728,35.723,35.772,35.754,35.785,35.752,35.73,35.75,35.716,35.669,35.684,35.722,35.735,35.669,35.683,35.753,35.769,35.769,35.731,35.742,35.759
+[CP] LIN 4. Ancho total medio arriba- 35.76,CP,35.76,0.06,0.06,35.748,35.74,35.758,35.741,35.759,35.746,35.749,35.753,35.749,35.744,35.734,35.756,35.755,35.767,35.764,35.755,35.767,35.755,35.764,35.738,35.728,35.741,35.745,35.733,35.727,35.733,35.745,35.763,35.727,35.764,35.757,35.759,35.742,35.746,35.751,35.758
+[CP] LIN 5. Ancho total medio medio- 35.76,CP,35.76,0.06,0.06,35.962,35.977,35.961,36.014,35.991,35.962,35.94,36.011,35.94,35.956,35.977,36.01,35.997,35.994,35.948,35.965,35.939,36.001,35.965,35.923,35.994,35.974,35.986,35.821,35.938,35.945,35.989,36.02,35.938,35.995,36.006,36.025,36.06,36.054,36.045,36.046
+[CP] LIN 6. Ancho total medio abajo- 35.76,CP,35.76,0.06,0.06,35.779,35.739,35.734,35.735,35.752,35.777,35.773,35.748,35.773,35.773,35.712,35.756,35.723,35.727,35.794,35.738,35.738,35.741,35.734,35.789,35.775,35.755,35.759,35.761,35.723,35.716,35.748,35.769,35.723,35.726,35.74,35.769,35.774,35.74,35.737,35.746
+[CP] LIN 7. Ancho total respaldo arriba- 35.76,CP,35.76,0.06,0.06,35.744,35.735,35.744,35.735,35.749,35.74,35.746,35.741,35.746,35.732,35.724,35.752,35.743,35.743,35.745,35.742,35.744,35.748,35.751,35.738,35.722,35.726,35.736,35.734,35.72,35.726,35.733,35.751,35.72,35.746,35.743,35.759,35.73,35.734,35.735,35.737
+[CP] LIN 8. Ancho total respaldo medio- 35.76,CP,35.76,0.06,0.06,35.732,35.721,35.732,35.722,35.745,35.735,35.748,35.745,35.748,35.679,35.686,35.747,35.732,35.735,35.72,35.714,35.723,35.709,35.722,35.725,35.72,35.736,35.713,35.714,35.721,35.734,35.723,35.744,35.721,35.763,35.74,35.729,35.735,35.735,35.722,35.743
+[CP] LIN 9. Ancho total respaldo abajo- 35.76,CP,35.76,0.06,0.06,35.657,35.683,35.69,35.641,35.663,35.681,35.705,35.628,35.705,35.563,35.632,35.747,35.666,35.681,35.67,35.644,35.675,35.589,35.648,35.657,35.634,35.654,35.649,35.647,35.677,35.631,35.692,35.68,35.677,35.73,35.673,35.659,35.704,35.673,35.666,35.68
+[CP] LIN 10. Altura interna linner FZ- 62.571,CP,62.571,0.06,0.06,62.519,62.501,62.532,62.52,62.538,62.519,62.521,62.505,62.521,62.512,62.499,62.505,62.511,62.526,62.507,62.497,62.498,62.484,62.511,62.498,62.525,62.531,62.527,62.537,62.507,62.51,62.498,62.496,62.507,62.511,62.492,62.5,62.488,62.494,62.472,62.495
+[CTQ] LIN 11. Altura interna linner FF- 64.426,CTQ,64.426,0.06,0.06,64.398,64.396,64.396,64.376,64.392,64.382,64.386,64.389,64.386,64.415,64.402,64.406,64.421,64.411,64.399,64.394,64.392,64.368,64.407,64.363,64.384,64.373,64.404,64.387,64.393,64.388,64.401,64.384,64.393,64.416,64.4,64.378,64.371,64.362,64.371,64.379
+[CP] LIN 12. Altura total lado FZ- 68.004,CP,68.004,0.06,0.06,68.033,68.009,68.074,68.034,68.044,68.051,68.043,68.068,68.043,68.03,68.004,68.084,68.011,68.046,68.022,68.005,68.024,68.003,68.053,68.009,68.032,68.068,68.023,68.004,68.005,68.049,68.029,68.012,68.005,68.085,68.025,68.042,68.036,68.053,68.08,68.081
+[CP] LIN 13. Altura total lado FF- 68.004,CP,68.004,0.06,0.06,68.09,68.072,68.091,68.077,68.13,68.08,68.111,68.096,68.111,68.09,68.064,68.127,68.056,68.098,68.088,68.048,68.077,68.051,68.085,68.052,68.073,68.076,68.058,68.05,68.044,68.069,68.055,68.048,68.044,68.121,68.057,68.107,68.083,68.098,68.106,68.117
+[CP] LIN 13. Ancho entre costillas frente FZ_5- 11.011,CP,11.011,0.06,0.06,11.054,11.053,11.063,11.059,11.07,11.039,11.048,11.05,11.048,11.011,11.064,11.065,11.053,11.056,11.04,11.016,11.024,11.052,11.055,11.06,11.077,11.081,11.088,11.007,11.027,11.03,11.083,11.101,11.027,11.106,11.129,11.061,11.076,11.091,11.095,11.072
+[CP] LIN 14. Ancho entre costillas respaldo FZ_1- 11.184,CP,11.184,0.06,0.06,11.225,11.235,11.233,11.244,11.224,11.223,11.198,11.245,11.198,11.251,11.277,11.248,11.255,11.261,11.238,11.235,11.232,11.271,11.247,11.208,11.259,11.253,11.252,11.149,11.245,11.26,11.254,11.267,11.245,11.263,11.274,11.253,11.256,11.265,11.255,11.245
+[CP] LIN 15. Ancho entre costillas respaldo FZ_2- 11.184,CP,11.184,0.06,0.06,11.258,11.265,11.267,11.283,11.266,11.255,11.23,11.284,11.23,11.273,11.311,11.284,11.286,11.3,11.261,11.251,11.244,11.308,11.278,11.236,11.295,11.284,11.288,11.163,11.274,11.294,11.297,11.29,11.274,11.277,11.305,11.289,11.29,11.306,11.298,11.285
+[CP] LIN 16. Ancho entre costillas respaldo FZ_3- 11.184,CP,11.184,0.06,0.06,11.255,11.264,11.254,11.282,11.261,11.249,11.234,11.29,11.234,11.264,11.306,11.279,11.28,11.293,11.251,11.249,11.24,11.309,11.276,11.239,11.299,11.282,11.299,11.162,11.274,11.289,11.291,11.285,11.274,11.267,11.313,11.285,11.292,11.311,11.306,11.284
+[CP] LIN 17. Ancho entre costillas frente FZ_1- 11.184,CP,11.184,0.06,0.06,11.201,11.207,11.226,11.225,11.214,11.188,11.187,11.207,11.187,11.201,11.251,11.227,11.232,11.234,11.174,11.173,11.174,11.233,11.203,11.218,11.243,11.239,11.241,11.135,11.207,11.234,11.239,11.241,11.207,11.263,11.278,11.227,11.234,11.244,11.248,11.218
+[CP] LIN 18. Ancho entre costillas frente FZ_2- 11.184,CP,11.184,0.06,0.06,11.214,11.22,11.248,11.252,11.257,11.196,11.201,11.225,11.201,11.203,11.27,11.255,11.246,11.271,11.181,11.169,11.175,11.266,11.231,11.233,11.266,11.257,11.283,11.119,11.202,11.241,11.282,11.251,11.202,11.272,11.322,11.244,11.257,11.277,11.285,11.249
+[CP] LIN 19. Ancho entre costillas frente FZ_3- 11.184,CP,11.184,0.06,0.06,11.224,11.228,11.246,11.26,11.278,11.197,11.201,11.226,11.201,11.197,11.266,11.255,11.244,11.277,11.186,11.171,11.18,11.281,11.245,11.24,11.274,11.261,11.303,11.119,11.197,11.236,11.295,11.254,11.197,11.271,11.339,11.241,11.26,11.289,11.296,11.261
+[CP] LIN 20. Ancho entre costillas respaldo FZ_4- 11.011,CP,11.011,0.06,0.06,11.06,11.066,11.057,11.078,11.063,11.054,11.036,11.091,11.036,11.065,11.096,11.074,11.081,11.084,11.063,11.057,11.058,11.098,11.079,11.059,11.099,11.093,11.1,10.987,11.073,11.087,11.091,11.108,11.073,11.09,11.113,11.072,11.084,11.107,11.097,11.08
+[CP] LIN 21. Ancho entre costillas respaldo FZ_5- 11.011,CP,11.011,0.06,0.06,11.014,11.018,11.018,11.012,11.009,11.012,11.015,11.039,11.015,11.01,11.03,11.033,11.025,11.027,11.023,11.019,11.022,11.03,11.025,11.034,11.058,11.064,11.051,10.983,11.022,11.026,11.041,11.072,11.022,11.064,11.059,11.023,11.038,11.046,11.043,11.029
+[CP] LIN 22. Ancho entre costillas frente FZ_4- 11.011,CP,11.011,0.06,0.06,11.07,11.07,11.079,11.1,11.097,11.042,11.05,11.072,11.05,11.04,11.097,11.085,11.081,11.103,11.047,11.028,11.036,11.117,11.086,11.076,11.122,11.106,11.131,11.005,11.051,11.077,11.11,11.104,11.051,11.118,11.15,11.08,11.104,11.121,11.127,11.093
+[CP] LIN 24. Ancho entre costillas respaldo FF_1- 16.873,CP,16.873,0.06,0.06,16.863,16.87,16.859,16.865,16.872,16.863,16.869,16.864,16.869,16.834,16.825,16.861,16.837,16.834,16.886,16.892,16.883,16.88,16.883,16.867,16.862,16.859,16.859,16.901,16.876,16.875,16.882,16.854,16.876,16.842,16.845,16.862,16.866,16.869,16.867,16.869
+[CP] LIN 25. Ancho entre costillas respaldo FF_2- 16.873,CP,16.873,0.06,0.06,16.851,16.856,16.851,16.858,16.863,16.852,16.861,16.851,16.861,16.822,16.81,16.854,16.833,16.822,16.875,16.883,16.877,16.873,16.872,16.864,16.857,16.855,16.851,16.899,16.87,16.864,16.878,16.841,16.87,16.839,16.84,16.841,16.844,16.842,16.848,16.847
+[CP] LIN 26. Ancho entre costillas respaldo FF_3- 16.873,CP,16.873,0.06,0.06,16.864,16.867,16.864,16.869,16.876,16.87,16.877,16.864,16.877,16.843,16.829,16.865,16.839,16.825,16.887,16.894,16.883,16.883,16.885,16.878,16.87,16.868,16.864,16.912,16.888,16.886,16.895,16.861,16.888,16.854,16.864,16.851,16.855,16.85,16.854,16.852
+[CP] LIN 27. Ancho entre costillas frente FF_1- 16.873,CP,16.873,0.06,0.06,16.982,16.985,16.948,16.984,16.983,16.986,16.98,16.968,16.98,16.967,16.934,16.976,16.945,16.935,16.975,17.003,16.988,16.982,16.99,16.957,16.973,16.954,16.945,17.017,16.999,17,16.971,16.972,16.999,16.962,16.946,16.994,16.998,16.987,16.984,16.989
+[CP] LIN 28. Ancho entre costillas frente FF_2- 16.873,CP,16.873,0.06,0.06,16.978,16.981,16.945,16.983,16.972,16.983,16.985,16.966,16.985,16.971,16.93,16.975,16.945,16.925,16.979,17.02,17.001,16.977,16.997,16.944,16.978,16.959,16.934,17.017,17.019,17.01,16.972,16.985,17.019,16.971,16.955,17.003,17.003,16.992,16.983,16.995
+[CP] LIN 29. Ancho entre costillas frente FF_3- 16.873,CP,16.873,0.06,0.06,16.988,16.998,16.966,16.997,16.979,16.999,17.005,16.992,17.005,16.987,16.947,16.999,16.964,16.931,16.999,17.043,17.024,16.995,17.006,16.959,17.003,16.981,16.946,17.028,17.043,17.029,16.986,17.009,17.043,16.985,16.977,17.026,17.011,17.006,16.991,17.002
+[CP] LIN 30. Ancho entre costillas respaldo FF_4- 16.656,CP,16.656,0.06,0.06,16.74,16.745,16.72,16.755,16.737,16.748,16.742,16.734,16.742,16.725,16.706,16.728,16.71,16.684,16.757,16.77,16.747,16.761,16.743,16.751,16.751,16.724,16.727,16.78,16.768,16.759,16.745,16.733,16.768,16.704,16.72,16.74,16.725,16.719,16.723,16.712
+[CP] LIN 31. Ancho entre costillas respaldo FF_5- 16.656,CP,16.656,0.06,0.06,16.688,16.694,16.676,16.705,16.685,16.699,16.687,16.683,16.687,16.666,16.66,16.68,16.662,16.642,16.702,16.708,16.691,16.706,16.692,16.702,16.701,16.687,16.688,16.704,16.714,16.701,16.689,16.658,16.714,16.641,16.664,16.673,16.661,16.661,16.665,16.657
+[CP] LIN 32. Ancho entre costillas frente FF_4- 16.656,CP,16.656,0.06,0.06,16.812,16.813,16.785,16.823,16.801,16.812,16.819,16.8,16.819,16.795,16.778,16.81,16.786,16.727,16.809,16.842,16.829,16.81,16.793,16.801,16.84,16.798,16.765,16.852,16.856,16.834,16.81,16.806,16.856,16.799,16.779,16.819,16.817,16.792,16.785,16.776
+[CP] LIN 33. Ancho entre costillas frente FF_5- 16.656,CP,16.656,0.06,0.06,16.773,16.766,16.745,16.788,16.755,16.772,16.773,16.756,16.773,16.74,16.728,16.763,16.748,16.696,16.778,16.783,16.773,16.768,16.75,16.768,16.778,16.757,16.731,16.777,16.791,16.774,16.749,16.757,16.791,16.739,16.734,16.748,16.743,16.732,16.716,16.716
+[CP] LIN 34. Profundidad lado Top FF Ext- 29.125,CP,29.125,0.06,0.06,29.081,29.089,29.085,29.121,29.128,29.112,29.141,29.155,29.139,29.12,29.137,29.152,29.147,29.161,29.123,29.135,29.143,29.148,29.153,29.122,29.14,29.153,29.145,29.121,29.132,29.148,29.147,29.111,29.132,29.153,29.153,29.13,29.139,29.143,29.132,29.157
+[CP] LIN 35. Profundidad lado Bottom FF Ext- 29.193,CP,29.193,0.06,0.06,29.183,29.171,29.219,29.218,29.215,29.177,29.192,29.198,29.192,29.176,29.233,29.108,29.217,29.217,29.152,29.146,29.138,29.178,29.191,29.123,29.196,29.207,29.18,29.085,29.069,29.11,29.118,29.049,29.069,29.159,29.156,29.055,29.128,29.129,29.163,29.168
+[CP] LIN 36. Profundidad lado Top FF Ext- 29.375,CP,29.375,0.06,0.06,29.328,29.387,29.382,29.399,29.405,29.322,29.345,29.358,29.345,29.375,29.374,29.348,29.34,29.348,29.389,29.379,29.371,29.364,29.347,29.356,29.269,29.27,29.332,29.302,29.322,29.314,29.467,29.366,29.322,29.373,29.294,29.399,29.44,29.434,29.428,29.418
+[CP] LIN 37. Profundidad lado Top FZ Ext- 29.125,CP,29.125,0.06,0.06,29.13,29.122,29.144,29.135,29.166,29.124,29.127,29.132,29.127,29.132,29.144,29.131,29.145,29.161,29.123,29.138,29.141,29.151,29.15,29.122,29.137,29.147,29.15,29.127,29.139,29.142,29.142,29.099,29.139,29.148,29.15,29.145,29.15,29.164,29.153,29.183
+[CP] LIN 38. Profundidad lado Bottom FZ Ext- 29.193,CP,29.193,0.06,0.06,29.169,29.186,29.178,29.218,29.161,29.171,29.186,29.193,29.186,29.31,29.168,29.145,29.237,29.235,29.151,29.16,29.186,29.132,29.141,29.11,29.108,29.145,29.109,29.211,29.23,29.229,29.198,29.165,29.23,29.228,29.196,29.164,29.149,29.16,29.162,29.152
+[CP] LIN 39. Profundidad lado Top FZ Ext- 29.375,CP,29.375,0.06,0.06,29.398,29.382,29.382,29.405,29.421,29.389,29.325,29.325,29.325,29.438,29.428,29.333,29.372,29.405,29.355,29.351,29.347,29.375,29.364,29.418,29.408,29.395,29.395,29.376,29.343,29.328,29.313,29.421,29.343,29.411,29.389,29.455,29.438,29.45,29.436,29.45
+[CP] LIN 40. Profundidad lado Bottom FF Ext- 29.133,CP,29.133,0.06,0.06,29.168,29.18,29.174,29.204,29.179,29.142,29.172,29.167,29.172,29.135,29.191,29.157,29.209,29.263,29.138,29.134,29.129,29.264,29.163,29.158,29.167,29.167,29.193,29.135,29.152,29.161,29.156,29.124,29.152,29.197,29.186,29.098,29.116,29.126,29.187,29.163
+[CP] LIN 41. Profundidad lado Bottom FZ Ext- 29.133,CP,29.133,0.06,0.06,29.159,29.154,29.15,29.215,29.146,29.153,29.158,29.167,29.158,29.264,29.118,29.116,29.197,29.19,29.134,29.147,29.165,29.117,29.123,29.138,29.125,29.16,29.116,29.188,29.207,29.202,29.173,29.174,29.207,29.216,29.196,29.152,29.126,29.146,29.139,29.126
+[CP] LIN 42. Profundidad Linner FZ Sup- 25.313,CP,25.313,0.045,0.045,25.167,25.189,25.209,25.183,25.172,25.184,25.217,25.199,25.217,25.169,25.183,25.208,25.159,25.162,25.216,25.214,25.24,25.187,25.203,25.16,25.167,25.183,25.17,25.184,25.185,25.15,25.151,25.162,25.185,25.187,25.133,25.177,25.188,25.192,25.195,25.211
+[CP] LIN 43. Profundidad Linner FZ Med- 25.313,CP,25.313,0.045,0.045,25.177,25.188,25.199,25.176,25.18,25.186,25.189,25.181,25.189,25.18,25.183,25.171,25.167,25.188,25.215,25.222,25.253,25.194,25.206,25.138,25.168,25.156,25.158,25.199,25.23,25.207,25.188,25.154,25.23,25.165,25.16,25.197,25.208,25.185,25.216,25.246
+[CP] LIN 44. Profundidad Linner FZ Inf- 25.413,CP,25.413,0.045,0.045,25.199,25.2,25.228,25.244,25.213,25.205,25.237,25.177,25.237,25.202,25.174,25.194,25.207,25.223,25.216,25.236,25.25,25.207,25.235,25.229,25.202,25.175,25.183,25.327,25.284,25.281,25.258,25.154,25.284,25.21,25.202,25.241,25.222,25.198,25.222,25.267
+[CP] LIN 45. Profundidad Linner FF Sup- 26.745,CP,26.745,0.045,0.045,26.684,26.677,26.685,26.654,26.666,26.664,26.71,26.698,26.71,26.663,26.667,26.698,26.623,26.652,26.702,26.69,26.686,26.662,26.698,26.694,26.69,26.688,26.682,26.656,26.653,26.654,26.64,26.65,26.653,26.67,26.68,26.642,26.646,26.662,26.636,26.643
+[CP] LIN 46. Profundidad Linner FF Med- 26.745,CP,26.745,0.045,0.045,26.657,26.644,26.671,26.637,26.644,26.634,26.689,26.711,26.689,26.659,26.676,26.698,26.618,26.65,26.677,26.671,26.681,26.661,26.678,26.658,26.689,26.688,26.675,26.635,26.65,26.665,26.652,26.648,26.65,26.686,26.669,26.633,26.638,26.65,26.634,26.644
+[CP] LIN 47. Profundidad Linner FF Inf- 26.745,CP,26.745,0.045,0.045,26.663,26.641,26.671,26.654,26.663,26.654,26.697,26.691,26.697,26.635,26.646,26.682,26.61,26.634,26.672,26.665,26.686,26.668,26.691,26.683,26.677,26.667,26.651,26.652,26.636,26.657,26.63,26.628,26.636,26.664,26.63,26.615,26.632,26.64,26.633,26.638
+[CP] GD&T 48. Planicidad mullion Sup- 0,CP,0,0.03,0.03,0.005,0.003,0.004,0,0.006,0.002,0.002,0,0.002,0.006,0.001,0.003,0.007,0,0.001,0.001,0.004,0.001,0,0.003,0.001,0.004,0.003,0.011,0,0.004,0.001,0.001,0,0.001,0.009,0.001,0.003,0.003,0,0.001
+[CP] GD&T 49. Planicidad mullion Med- 0,CP,0,0.03,0.03,0.002,0.006,0.003,0.004,0.004,0.003,0.001,0.003,0.001,0.001,0.003,0.001,0.003,0.008,0.004,0.002,0.002,0.003,0.001,0.001,0.003,0.003,0,0.007,0.003,0.006,0.003,0.004,0.003,0.002,0.002,0.007,0.004,0.003,0.003,0.005
+[CP] GD&T 50. Planicidad mullion Inf- 0,CP,0,0.03,0.03,0.002,0.009,0.001,0.004,0.003,0.001,0.004,0.005,0.004,0.001,0.001,0.007,0.001,0.003,0.002,0.003,0.003,0.002,0.005,0.002,0.009,0.002,0.003,0.008,0.013,0.001,0.004,0.001,0.013,0,0.003,0.001,0.005,0.002,0.001,0.002
+[CP] LIN 51. Angulo- 88.5,CP,88.5,2,2,86.4,85.4,85.3,85.6,85,85.9,87.6,87,87.6,86.1,85.7,87.4,85.7,86.2,87.9,88,87,87.6,87.6,85.7,87.3,86.4,86.9,85.7,87.1,86.8,85.1,86.7,87.1,86.5,86.4,85.8,86,83.9,87.1,85.4
+[CP] LIN 52. Angulo- 91.9,CP,91.9,2,2,92.8,92.1,92.3,92.1,91.2,92.9,91.5,92.4,91.5,93.3,92.8,91.9,91.9,92.7,91.8,91.5,92.2,91.6,90.7,93.6,93,92.9,91.5,94,93.4,93.3,93.3,92.6,93.4,92.3,87.8,94.1,94.2,93.9,92.9,94.3
+[CP] LIN 53. Angulo- 90,CP,90,2,2,90.6,90.4,91.5,91.4,89.8,91,90.5,90.5,90.5,91.1,91.4,90.6,91.3,91.5,91.3,91.4,93.1,91,90.7,91.3,90.5,91.8,89.8,91.3,91.9,90,90.4,89.6,91.9,91.4,88.9,91.7,92,92.7,91.2,93.8
+[CP] LIN 54. Angulo- 90.4,CP,90.4,2,2,89.2,89.8,88.8,88.1,90,89,89.5,89.3,89.5,88.8,89.1,89.1,87.8,88.9,89.5,89.9,88.7,90.6,90.6,89.2,91.2,90.7,92.7,88.2,88,88.3,90.6,91.7,88,89.9,91.9,89.4,89.7,89.6,90,88
+[CP] LIN 55. Angulo- 89.3,CP,89.3,2,2,87.2,86.9,87.2,86.7,88.2,87.4,88.5,87.8,88.5,85.9,86.3,88.8,87.3,86.1,87,87.2,87.3,87.1,87.4,85.9,88.4,88.3,87.1,88.7,88.9,88.2,88.1,87.6,88.9,87.7,82.7,87,87.9,87.7,88.4,87.4
+[CP] LIN 56. Angulo- 90.6,CP,90.6,2,2,86.4,87.5,87,87,87.3,87.3,88,86.9,88,86.3,86.8,87.2,87.8,87.3,87.4,87.9,87,92.2,87.8,85.7,87.6,88,87.6,88.4,90,89.3,88.5,88.1,90,86.2,84.4,87.7,88.8,87.9,89.6,89
+[CP] LIN 67. Espesor de pared Top FF- 1.557,CP,1.557,0.06,0.06,1.583,1.616,1.63,1.611,1.623,1.592,1.608,1.599,1.608,1.617,1.575,1.602,1.544,1.562,1.586,1.58,1.595,1.595,1.591,1.604,1.606,1.598,1.558,1.569,1.598,1.594,1.588,1.565,1.598,1.593,1.541,1.594,1.599,1.605,1.615,1.591
+[CP] LIN 68. Espesor de pared Top FZ- 2.585,CP,2.585,0.06,0.06,2.59,2.595,2.612,2.609,2.577,2.595,2.609,2.609,2.609,2.575,2.584,2.61,2.546,2.573,2.582,2.586,2.596,2.595,2.599,2.593,2.604,2.622,2.588,2.594,2.616,2.619,2.591,2.562,2.616,2.585,2.507,2.575,2.597,2.592,2.603,2.589
+[CP] LIN 69. Espesor de pared FZ Sup- 2.4,CP,2.4,0.06,0.06,2.412,2.409,2.406,2.426,2.42,2.401,2.442,2.455,2.442,2.443,2.448,2.457,2.453,2.471,2.451,2.451,2.437,2.447,2.446,2.45,2.466,2.441,2.454,2.429,2.44,2.432,2.463,2.472,2.44,2.472,2.491,2.425,2.442,2.453,2.431,2.453
+[CP] LIN 70. Espesor de pared FZ Med- 2.4,CP,2.4,0.06,0.06,2.456,2.466,2.454,2.484,2.453,2.466,2.496,2.537,2.496,2.494,2.489,2.508,2.49,2.498,2.493,2.496,2.482,2.485,2.466,2.458,2.474,2.45,2.485,2.424,2.467,2.449,2.43,2.476,2.467,2.464,2.464,2.485,2.481,2.485,2.481,2.513
+[CP] LIN 71. Espesor de pared FZ Inf- 2.423,CP,2.423,0.06,0.06,2.474,2.47,2.451,2.473,2.467,2.457,2.488,2.517,2.488,2.489,2.481,2.499,2.479,2.491,2.483,2.482,2.465,2.454,2.46,2.487,2.493,2.46,2.503,2.398,2.426,2.416,2.42,2.464,2.426,2.457,2.469,2.488,2.488,2.495,2.484,2.516
+[CP] LIN 72. Espesor de pared FF Sup- 1.565,CP,1.565,0.06,0.06,1.539,1.539,1.548,1.557,1.56,1.536,1.533,1.535,1.533,1.555,1.548,1.539,1.611,1.624,1.549,1.553,1.563,1.552,1.564,1.539,1.567,1.564,1.574,1.524,1.534,1.535,1.568,1.581,1.534,1.563,1.571,1.575,1.585,1.58,1.59,1.599
+[CP] LIN 73. Espesor de pared FF Med- 1.561,CP,1.561,0.06,0.06,1.501,1.5,1.55,1.515,1.514,1.506,1.525,1.519,1.525,1.521,1.518,1.528,1.548,1.569,1.542,1.54,1.558,1.518,1.527,1.496,1.521,1.557,1.524,1.468,1.474,1.468,1.53,1.535,1.474,1.539,1.56,1.529,1.595,1.551,1.552,1.562
+[CP] LIN 74. Espesor de pared FF Inf- 1.568,CP,1.568,0.06,0.06,1.549,1.53,1.574,1.547,1.549,1.538,1.57,1.569,1.57,1.527,1.512,1.574,1.553,1.564,1.577,1.55,1.587,1.56,1.573,1.532,1.538,1.576,1.553,1.535,1.52,1.527,1.595,1.57,1.52,1.565,1.581,1.563,1.607,1.584,1.578,1.593
+[CP] LIN 75. Espesor de pared Mullion Sup- 1.311,CP,1.311,0.06,0.06,1.289,1.28,1.291,1.293,1.31,1.29,1.283,1.276,1.283,1.281,1.293,1.283,1.291,1.291,1.295,1.29,1.297,1.306,1.295,1.286,1.279,1.266,1.269,1.289,1.284,1.295,1.302,1.305,1.284,1.317,1.304,1.28,1.278,1.259,1.278,1.29
+[CP] LIN 76. Espesor de pared Mullion Med- 1.309,CP,1.309,0.06,0.06,1.257,1.258,1.263,1.266,1.288,1.265,1.263,1.255,1.263,1.274,1.287,1.264,1.288,1.286,1.267,1.266,1.272,1.276,1.275,1.273,1.261,1.27,1.272,1.266,1.263,1.271,1.266,1.292,1.263,1.304,1.297,1.283,1.291,1.285,1.295,1.296
+[CP] LIN 77. Espesor de pared Mullion Inf- 1.534,CP,1.534,0.06,0.06,1.54,1.549,1.536,1.551,1.557,1.546,1.537,1.532,1.537,1.568,1.58,1.532,1.575,1.571,1.551,1.555,1.552,1.566,1.566,1.538,1.54,1.535,1.542,1.55,1.556,1.559,1.543,1.571,1.556,1.575,1.578,1.575,1.584,1.562,1.584,1.578
+[CP] LIN 78. Diagonal1- 75.979,CP,75.979,0.065,0.065,75.979,75.927,76.022,75.988,76.019,75.979,75.987,76.038,75.99,75.979,75.97,76.023,75.964,75.951,75.979,75.93,75.99,75.946,75.958,75.979,76.003,76.018,75.979,75.979,75.875,75.924,75.921,75.979,75.9,76.038,75.938,75.979,75.969,75.959,75.982,76.011
+[CP] LIN 79. Diagonal2- 75.979,CP,75.979,0.065,0.065,75.979,75.968,75.994,75.932,75.982,75.979,76,75.961,76.017,75.979,76.004,76.002,76.041,76.048,75.979,75.96,75.978,76.003,76.022,75.979,75.982,75.976,75.983,75.979,76.005,76.041,76.033,75.979,76.005,76.03,76.005,75.979,76.063,76.02,76.008,76.025
+[CTQ] LIN 81. Ancho interno FZ_1- 12.484,CTQ,12.484,0.035,0.035,12.509,12.516,12.533,12.534,12.523,12.498,12.493,12.514,12.493,12.513,12.558,12.536,12.537,12.548,12.487,12.48,12.484,12.543,12.515,12.519,12.553,12.546,12.551,12.432,12.506,12.535,12.551,12.55,12.506,12.567,12.577,12.539,12.548,12.557,12.56,12.531
+[CTQ] LIN 82. Ancho interno FZ_2- 12.484,CTQ,12.484,0.035,0.035,12.523,12.531,12.551,12.56,12.558,12.507,12.508,12.536,12.508,12.517,12.579,12.562,12.556,12.582,12.495,12.482,12.488,12.579,12.544,12.532,12.573,12.56,12.58,12.428,12.513,12.55,12.588,12.554,12.513,12.571,12.602,12.553,12.565,12.585,12.594,12.556
+[CTQ] LIN 83. Ancho interno FZ_3- 12.484,CTQ,12.484,0.02,0.02,12.523,12.532,12.544,12.559,12.567,12.504,12.503,12.531,12.503,12.507,12.571,12.555,12.548,12.578,12.497,12.484,12.487,12.586,12.553,12.534,12.573,12.557,12.591,12.423,12.505,12.54,12.59,12.553,12.505,12.564,12.61,12.544,12.562,12.586,12.597,12.557
+[CTQ] LIN 84. Ancho interno FF_1- 17.991,CTQ,17.991,0.035,0.035,18.072,18.076,18.038,18.074,18.074,18.076,18.071,18.061,18.071,18.059,18.028,18.061,18.037,18.024,18.067,18.095,18.077,18.072,18.081,18.051,18.067,18.047,18.036,18.107,18.091,18.092,18.059,18.063,18.091,18.046,18.038,18.083,18.089,18.077,18.075,18.08
+[CTQ] LIN 85. Ancho interno FF_2- 17.991,CTQ,17.991,0.035,0.035,18.064,18.07,18.032,18.072,18.06,18.07,18.071,18.057,18.071,18.061,18.023,18.065,18.036,18.014,18.069,18.107,18.087,18.068,18.085,18.036,18.07,18.05,18.027,18.103,18.106,18.099,18.064,18.069,18.106,18.06,18.042,18.092,18.092,18.08,18.074,18.082
+[CP] LIN 86. Ancho interno FF_3- 17.969,CP,17.969,0.02,0.02,18.101,18.109,18.074,18.118,18.089,18.11,18.108,18.1,18.108,18.104,18.065,18.102,18.079,18.033,18.112,18.142,18.127,18.114,18.106,18.09,18.123,18.094,18.064,18.14,18.151,18.138,18.099,18.118,18.151,18.086,18.08,18.123,18.106,18.1,18.088,18.092
+[CTQ] LIN 87. Ancho interno FF_4- 17.991,CTQ,17.991,0.035,0.035,18.076,18.084,18.05,18.098,18.07,18.087,18.076,18.072,18.076,18.077,18.049,18.071,18.048,18.009,18.085,18.108,18.089,18.09,18.073,18.079,18.099,18.07,18.05,18.109,18.12,18.104,18.072,18.081,18.12,18.043,18.049,18.085,18.07,18.064,18.054,18.052
+[CP] LIN 88. Ancho interno FF_5- 17.938,CP,17.938,0.02,0.02,17.989,17.995,17.975,17.999,17.988,17.998,17.986,17.989,17.986,17.975,17.966,17.983,17.957,17.939,17.989,18,17.982,17.998,17.983,18.003,17.998,17.988,17.979,17.996,18.007,17.997,17.979,17.972,18.007,17.946,17.951,17.97,17.957,17.952,17.953,17.953
+[CTQ] LIN 89. Ancho interno FZ_4- 12.263,CTQ,12.263,0.035,0.035,12.272,12.272,12.29,12.291,12.309,12.249,12.256,12.267,12.256,12.236,12.301,12.293,12.275,12.311,12.235,12.221,12.231,12.303,12.29,12.273,12.3,12.295,12.321,12.196,12.241,12.275,12.329,12.301,12.241,12.324,12.355,12.281,12.299,12.312,12.334,12.293
+[CTQ] LIN 90. Ancho interno FZ_5- 12.263,CTQ,12.263,0.035,0.035,12.255,12.251,12.26,12.257,12.27,12.238,12.252,12.25,12.252,12.225,12.264,12.267,12.246,12.266,12.233,12.22,12.227,12.269,12.264,12.26,12.274,12.275,12.291,12.222,12.241,12.253,12.295,12.29,12.241,12.3,12.321,12.265,12.273,12.283,12.295,12.268
+[DVA] GD&T DVA01 Perfil de superficie- 0,DVA Apariencia,0,0.083,0.083,0.175,0.161,0.163,0.147,0.152,0.182,0.157,0.174,0.157,0.201,0.184,0.12,0.162,0.172,0.175,0.16,0.172,0.162,0.175,0.172,0.161,0.17,0.171,0.183,0.122,0.181,0.162,0.176,0.122,0.179,0.189,0.199,0.18,0.204,0.157,0.186
+[DVA] GD&T DVA02 Perfil de superficie- 0,DVA Apariencia,0,0.083,0.083,0.121,0.127,0.149,0.234,0.113,0.141,0.144,0.2,0.144,0.149,0.14,0.204,0.181,0.139,0.108,0.114,0.161,0.179,0.138,0.131,0.089,0.089,0.14,0.134,0.259,0.192,0.143,0.157,0.259,0.126,0.105,0.23,0.201,0.146,0.285,0.271
+[DVA] GD&T DVA03 Perfil de superficie- 0,DVA Apariencia,0,0.083,0.083,0.211,0.223,0.209,0.225,0.214,0.213,0.21,0.219,0.21,0.229,0.239,0.208,0.236,0.227,0.206,0.214,0.201,0.218,0.215,0.21,0.21,0.196,0.225,0.191,0.199,0.201,0.196,0.201,0.199,0.202,0.203,0.204,0.202,0.205,0.213,0.209
+[DVA] GD&T DVA04 Perfil de superficie- 0,DVA Apariencia,0,0.18,0.18,0.042,0.027,0.09,0.086,0.049,0.036,0.082,0.06,0.082,0.055,0.033,0.044,0.083,0.095,0.08,0.045,0.093,0.084,0.098,0.086,0.06,0.057,0.048,0.034,0.07,0.047,0.029,0.126,0.07,0.067,0.067,0.08,0.103,0.069,0.041,0.088
+[DVA] GD&T DVA05 Perfil de superficie- 0,DVA Apariencia,0,0.18,0.18,0.094,0.067,0.055,0.056,0.06,0.108,0.106,0.08,0.106,0.06,0.056,0.121,0.029,0.033,0.132,0.083,0.081,0.072,0.045,0.109,0.138,0.114,0.098,0.131,0.064,0.015,0.076,0.068,0.064,0.088,0.069,0.107,0.13,0.038,0.067,0.065
+[DVA] GD&T DVA06 Perfil de superficie- 0,DVA Apariencia,0,0.03,0.03,0.106,0.129,0.011,0.026,0.044,0.035,0.126,0.011,0.126,0.049,0.084,0.054,0.056,0.078,0.1,0.064,0.054,0.062,0.058,0.023,0.027,0.019,0.051,0.135,0.095,0.129,0.09,0.06,0.095,0.144,0.101,0.073,0.136,0.123,0.107,0.1
+[DVA] GD&T DVA07 Perfil de superficie- 0,DVA Apariencia,0,0.03,0.03,0.115,0.107,0.081,0.095,0.06,0.053,0.101,0.06,0.101,0.067,0.075,0.063,0.066,0.066,0.107,0.069,0.071,0.062,0.051,0.097,0.092,0.063,0.113,0.142,0.092,0.101,0.087,0.143,0.092,0.049,0.102,0.081,0.072,0.08,0.113,0.097
+[DVA] GD&T DVA08 Perfil de superficie- 0,DVA Apariencia,0,0.03,0.03,0.259,0.201,0.242,0.152,0.148,0.24,0.249,0.292,0.249,0.23,0.156,0.283,0.118,0.217,0.201,0.141,0.184,0.101,0.183,0.163,0.151,0.227,0.134,0.249,0.214,0.284,0.222,0.113,0.214,0.259,0.133,0.217,0.173,0.214,0.208,0.208
+[DVA] GD&T DVA09 Perfil de superficie- 0,DVA Apariencia,0,0.03,0.03,0.214,0.134,0.25,0.178,0.306,0.223,0.17,0.243,0.17,0.234,0.111,0.248,0.081,0.149,0.19,0.094,0.196,0.079,0.126,0.19,0.152,0.219,0.103,0.103,0.112,0.125,0.087,0.145,0.181,0.235,0.075,0.239,0.092,0.155,0.166,0.192
+[DVA] GD&T DVA10 Perfil de superficie- 0,DVA Apariencia,0,0.042,0.042,0.112,0.025,0.092,0.092,0.035,0.046,0.032,0.03,0.032,0.071,0.04,0.039,0.061,0.074,0.074,0.05,0.078,0.072,0.05,0.038,0.066,0.045,0.03,0.083,0.138,0.05,0.056,0.051,0.138,0.013,0.074,0.142,0.108,0.071,0.149,0.162
+[DVA] GD&T DVA11 Perfil de superficie- 0,DVA Apariencia,0,0.042,0.042,0.121,0.158,0.092,0.15,0.108,0.144,0.137,0.115,0.137,0.102,0.124,0.137,0.095,0.082,0.152,0.174,0.134,0.151,0.143,0.16,0.154,0.134,0.144,0.173,0.19,0.166,0.124,0.182,0.19,0.134,0.171,0.144,0.153,0.159,0.145,0.104
+[DVA] GD&T DVA12 Posicion Doghouse- 0,DVA Apariencia,0,0.03,0.03,0.093,0.065,0.038,0.032,0.07,0.069,0.114,0.164,0.115,0.088,0.037,0.133,0.127,0.132,0.11,0.059,0.129,0.206,0.192,0.059,0.061,0.092,0.103,0.106,0.124,0.202,0.102,0.148,0.124,0.1,0.134,0.149,0.176,0.177,0.191,0.217
+[DVA] GD&T 294D3446MPS042<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.011,0.013,0.025,0.05,0.011,0.01,0.007,0.02,-0.017,0.007,0.012,0.019,0.021,0.029,-0.001,0.008,0.018,0.034,-0.001,0.007,-0.012,-0.01,0.001,0.019,0.007,0.03,0.014,0.032,0.076,0.004,-0.031,0.078,0.056,0.039,0.063,0.057
+[DVA] GD&T 294D3446MPS043<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.025,0.017,0.054,-0.005,-0.001,0.002,0.007,0.021,0.007,-0.011,0.01,0.024,0.008,0.015,-0.011,0.003,0.044,-0.018,-0.01,0.013,-0.004,0.024,0.008,-0.005,0.007,0.032,0.017,0.006,0.07,0.004,-0.021,0.048,0.061,0.04,0.052,0.049
+[DVA] GD&T 294D3446MPS087<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.028,-0.008,0.003,-0.011,-0.026,-0.007,-0.015,-0.003,-0.054,-0.004,-0.012,0.004,-0.006,-0.007,-0.022,-0.014,0.004,-0.006,-0.034,-0.008,-0.029,-0.017,-0.031,0.004,-0.015,0.015,-0.017,0.003,0.055,-0.006,-0.065,0.054,0.041,0.024,0.017,0.037
+[DVA] GD&T 294D3446MPS088<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.051,0.002,0.023,-0.025,-0.047,-0.018,-0.009,-0.004,-0.042,-0.034,-0.016,0.004,-0.043,-0.015,-0.031,-0.022,0.018,-0.029,-0.057,-0.012,-0.023,-0.001,-0.05,-0.041,-0.009,0.007,-0.045,-0.023,0.048,-0.004,-0.051,0.024,0.039,0.018,-0.012,0.008
+[DVA] GD&T 294D3446MPS089<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.037,-0.018,0.005,-0.014,-0.034,-0.008,-0.011,-0.006,-0.042,-0.003,-0.005,0.004,-0.008,-0.01,-0.02,-0.012,0.005,-0.013,-0.028,-0.017,-0.029,-0.022,-0.033,-0.002,-0.011,0.018,-0.025,0.006,0.037,0.005,-0.07,0.041,0.046,0.025,0.017,0.029
+[DVA] GD&T 294D3446MPS090<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.035,-0.02,0.005,-0.048,-0.056,-0.019,-0.011,-0.011,-0.052,-0.011,-0.011,0.008,-0.033,-0.011,-0.03,-0.018,0.002,-0.055,-0.055,-0.004,-0.021,-0.007,-0.036,-0.012,-0.011,0.001,-0.04,-0.01,0.028,-0.007,-0.05,0.032,0.031,0.016,-0.002,0.007
+[DVA] GD&T 294D3446MPS093<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.037,-0.034,-0.019,-0.028,-0.028,-0.026,-0.022,-0.024,-0.028,-0.028,-0.03,-0.015,-0.007,-0.015,-0.039,-0.04,-0.019,-0.027,-0.025,-0.039,-0.041,-0.028,-0.038,-0.052,-0.022,-0.036,-0.035,-0.021,-0.025,-0.012,-0.06,-0.002,-0.004,-0.013,-0.022,-0.01
+[DVA] GD&T 294D3446MPS094<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.037,-0.033,-0.013,-0.072,-0.064,-0.027,-0.028,-0.021,-0.07,-0.048,-0.046,-0.016,-0.072,-0.052,-0.049,-0.048,-0.021,-0.075,-0.071,-0.042,-0.042,-0.029,-0.074,-0.048,-0.028,-0.048,-0.069,-0.034,-0.028,-0.017,-0.076,-0.007,-0.005,-0.015,-0.049,-0.053
+[DVA] GD&T 294D3446MPS097<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.066,-0.062,-0.058,-0.082,-0.071,-0.064,-0.063,-0.065,-0.08,-0.038,-0.026,-0.072,-0.045,-0.033,-0.081,-0.073,-0.072,-0.081,-0.079,-0.079,-0.066,-0.09,-0.08,-0.073,-0.063,-0.08,-0.074,-0.079,-0.069,-0.094,-0.098,-0.082,-0.069,-0.084,-0.083,-0.074
+[DVA] GD&T 294D3446MPS098<E->>PPK1.0>>CPK1.33- 0,DVA Apariencia,0,0.04,0.04,-0.061,-0.078,-0.055,-0.087,-0.077,-0.069,-0.072,-0.072,-0.093,-0.051,-0.045,-0.084,-0.055,-0.056,-0.085,-0.088,-0.078,-0.094,-0.093,-0.084,-0.079,-0.085,-0.091,-0.085,-0.072,-0.086,-0.084,-0.084,-0.099,-0.094,-0.102,-0.087,-0.079,-0.087,-0.086,-0.079
+[CP] GD&T pto de superficie 183- 0,CP,0,0.03,0.03,-0.021,-0.025,0.001,-0.028,-0.021,-0.039,-0.027,-0.011,-0.027,-0.022,-0.02,-0.03,0.001,0.008,-0.003,-0.019,0.005,0,0.007,-0.016,-0.004,-0.011,-0.033,-0.037,-0.016,-0.033,-0.025,0.008,-0.016,-0.023,-0.002,-0.006,-0.014,-0.005,-0.024,0.002
+[CP] GD&T pto de superficie 184- 0,CP,0,0.03,0.03,0.03,0.04,0.064,0.046,0.088,0.008,0.062,0.094,0.062,0.046,0.068,0.107,0.096,0.125,0.045,0.024,0.06,0.075,0.1,0.058,0.117,0.124,0.114,-0.079,0.009,0.029,0.078,0.103,0.009,0.107,0.114,0.058,0.078,0.115,0.095,0.114
+[CP] GD&T pto de superficie 185- 0,CP,0,0.03,0.03,0.004,-0.026,-0.011,-0.014,-0.01,-0.009,-0.004,-0.02,-0.004,-0.01,-0.027,-0.048,-0.01,-0.018,-0.001,-0.029,-0.026,0,-0.004,0.005,-0.01,-0.017,-0.012,-0.041,-0.058,-0.045,-0.032,-0.024,-0.058,-0.054,-0.013,-0.006,-0.004,-0.016,-0.022,-0.009
+[CP] GD&T pto de superficie 186- 0,CP,0,0.03,0.03,-0.008,0.001,0.049,0.026,0.009,0.001,0.008,0.051,0.008,0.006,0,0.01,0.042,0.045,0.024,0.01,0.051,0.047,0.048,-0.002,-0.002,-0.002,-0.001,-0.006,0.035,0.031,0.002,0.045,0.035,0.014,0.01,0.055,0.036,0.038,0.051,0.065
+[CP] GD&T pto de superficie 187- 0,CP,0,0.03,0.03,0.127,0.15,0.143,0.169,0.144,0.13,0.139,0.223,0.139,0.148,0.164,0.18,0.186,0.201,0.136,0.129,0.137,0.19,0.172,0.1,0.152,0.139,0.162,0.022,0.158,0.174,0.143,0.203,0.158,0.166,0.182,0.21,0.218,0.247,0.237,0.252
+[CP] GD&T pto de superficie 188- 0,CP,0,0.03,0.03,0.027,0.024,0.007,0.032,0.018,0.018,0.058,0.045,0.058,0.051,0.003,0.017,0.023,0.035,0.034,0.022,0.024,0.048,0.037,0.03,0.024,0.009,0.027,-0.005,0.015,0.042,0.01,0.06,0.015,-0.001,0.035,0.043,0.055,0.051,0.05,0.056
+[CP] GD&T pto de superficie 189- 0,CP,0,0.03,0.03,-0.02,0.006,0.057,0.053,0.008,0.008,0.019,0.081,0.019,0.011,0.007,0.024,0.055,0.049,0.019,0.011,0.056,0.064,0.059,-0.002,-0.011,-0.016,0.008,0.002,0.053,0.061,0,0.059,0.053,0.017,0.009,0.092,0.051,0.054,0.081,0.086
+[CP] GD&T pto de superficie 190- 0,CP,0,0.03,0.03,0.002,0.009,0.029,0.017,0.008,0.013,0.061,0.084,0.061,-0.008,0,0.05,0.045,0.044,0.018,0.009,0.046,0.053,0.052,-0.007,-0.007,0.002,0.003,-0.004,0.041,0.07,-0.008,0.066,0.041,0.057,0.044,0.076,0.084,0.091,0.098,0.111
+[CP] GD&T pto de superficie 191- 0,CP,0,0.03,0.03,-0.025,0.025,0.003,-0.019,-0.024,-0.009,0.075,0.018,0.075,-0.005,-0.043,0.058,0.024,0.045,-0.009,-0.023,0.027,0.013,0.024,-0.038,-0.053,-0.009,-0.015,-0.037,0.011,0.047,-0.004,0.045,0.011,0.05,0.026,0.024,0.057,0.065,0.058,0.067
+[CP] GD&T pto de superficie 192- 0,CP,0,0.03,0.03,-0.015,-0.007,-0.034,-0.002,0.001,0.002,0.008,-0.013,0.008,0,-0.005,0.008,-0.021,-0.016,-0.015,-0.003,-0.018,-0.019,-0.018,-0.011,-0.03,-0.028,-0.004,-0.011,-0.039,-0.035,-0.012,-0.005,-0.039,0.001,-0.011,-0.018,-0.021,-0.027,-0.002,-0.018
+[CP] GD&T pto de superficie 193- 0,CP,0,0.03,0.03,-0.089,-0.115,-0.066,-0.049,-0.038,-0.084,-0.051,-0.073,-0.051,-0.062,-0.064,0.003,-0.04,-0.024,-0.064,-0.02,-0.033,-0.06,-0.034,-0.107,-0.04,-0.029,-0.04,-0.11,-0.09,-0.077,-0.009,-0.016,-0.09,0.029,0.021,-0.017,0.055,0.001,0.008,0.028
+[CP] GD&T pto de superficie 194- 0,CP,0,0.03,0.03,0.016,0,-0.007,0.007,0.004,0.009,0.012,0.001,0.012,0.004,0.003,-0.019,-0.013,-0.015,0.018,-0.003,-0.012,0.012,-0.003,0.02,0.003,-0.014,0.002,-0.004,-0.033,-0.03,-0.006,-0.001,-0.033,-0.023,0.006,0.015,0.013,-0.014,0.004,0.008
+[CP] GD&T pto de superficie 195- 0,CP,0,0.03,0.03,-0.004,-0.021,-0.051,-0.045,-0.011,-0.015,-0.019,-0.058,-0.019,-0.022,-0.026,-0.015,-0.048,-0.038,-0.02,-0.015,-0.044,-0.053,-0.043,-0.02,-0.03,-0.017,-0.014,-0.02,-0.068,-0.058,-0.017,-0.042,-0.068,-0.01,-0.012,-0.056,-0.054,-0.052,-0.061,-0.067
+[CP] GD&T pto de superficie 196- 0,CP,0,0.03,0.03,0.076,0.067,0.058,0.085,0.086,0.072,0.041,0.027,0.041,0.048,0.054,0.069,0.051,0.033,0.053,0.076,0.042,0.051,0.033,0.063,0.082,0.075,0.064,0.039,0.019,0.011,0.086,0.057,0.019,0.069,0.064,0.055,0.081,0.046,0.048,0.034
+[CP] GD&T pto de superficie 197- 0,CP,0,0.03,0.03,-0.008,-0.045,-0.033,-0.058,-0.027,-0.001,-0.046,-0.057,-0.046,-0.038,-0.051,-0.02,-0.06,-0.068,0,-0.044,-0.046,-0.068,-0.063,-0.001,-0.009,-0.013,-0.028,0.006,-0.053,-0.086,-0.022,-0.051,-0.053,-0.032,-0.054,-0.034,-0.041,-0.071,-0.073,-0.07
+[CP] GD&T pto de superficie 198- 0,CP,0,0.03,0.03,0.004,-0.03,-0.073,-0.078,-0.018,-0.028,-0.033,-0.1,-0.033,-0.04,-0.043,-0.033,-0.073,-0.066,-0.034,-0.029,-0.072,-0.076,-0.068,-0.02,-0.027,-0.018,-0.031,-0.028,-0.093,-0.095,-0.026,-0.068,-0.093,-0.032,-0.027,-0.093,-0.081,-0.08,-0.106,-0.109
+[CP] GD&T pto de superficie 199- 0,CP,0,0.03,0.03,-0.03,-0.048,-0.056,-0.055,-0.023,-0.038,-0.073,-0.099,-0.073,-0.073,-0.074,-0.063,-0.073,-0.069,-0.059,-0.055,-0.083,-0.105,-0.09,-0.028,-0.033,-0.026,-0.051,-0.042,-0.079,-0.096,-0.029,-0.082,-0.079,-0.053,-0.064,-0.107,-0.108,-0.117,-0.135,-0.128
+[CP] GD&T pto de superficie 200- 0,CP,0,0.03,0.03,-0.078,-0.102,-0.073,-0.1,-0.073,-0.07,-0.13,-0.15,-0.13,-0.192,-0.085,-0.071,-0.118,-0.124,-0.081,-0.093,-0.112,-0.184,-0.136,-0.064,-0.073,-0.097,-0.097,-0.077,-0.094,-0.177,-0.065,-0.125,-0.094,-0.08,-0.113,-0.125,-0.113,-0.152,-0.152,-0.147
+[CP] GD&T pto de superficie 201- 0,CP,0,0.03,0.03,-0.11,-0.076,-0.092,-0.06,-0.108,-0.096,-0.11,-0.109,-0.11,-0.088,-0.041,-0.131,-0.066,-0.093,-0.087,-0.053,-0.076,-0.036,-0.072,-0.082,-0.074,-0.102,-0.082,-0.101,-0.066,-0.096,-0.096,-0.08,-0.066,-0.137,-0.132,-0.124,-0.079,-0.097,-0.094,-0.116
+[CP] GD&T pto de superficie 202- 0,CP,0,0.03,0.03,0.064,0.049,0.033,0.014,0.044,0.051,0.062,0.077,0.062,0.05,0.015,0.099,0.028,0.04,0.054,0.029,0.052,0.025,0.035,0.058,0.022,0.045,0.029,0.038,0.033,0.059,0.071,0.057,0.033,0.1,0.113,0.098,0.065,0.077,0.096,0.095
+[CP] GD&T pto de superficie 203- 0,CP,0,0.03,0.03,-0.142,-0.103,-0.139,-0.11,-0.134,-0.138,-0.121,-0.159,-0.121,-0.128,-0.091,-0.164,-0.121,-0.128,-0.135,-0.109,-0.136,-0.071,-0.124,-0.12,-0.105,-0.135,-0.121,-0.096,-0.082,-0.101,-0.092,-0.124,-0.082,-0.168,-0.148,-0.174,-0.117,-0.123,-0.136,-0.154
+[CP] GD&T pto de superficie 204- 0,CP,0,0.03,0.03,-0.026,-0.063,-0.028,-0.036,-0.029,-0.014,-0.034,-0.001,-0.034,-0.057,-0.082,-0.013,-0.071,-0.053,-0.035,-0.055,-0.026,-0.067,-0.054,-0.013,-0.049,-0.009,-0.054,-0.062,-0.082,-0.057,-0.08,-0.03,-0.082,-0.018,-0.023,0.026,-0.024,-0.009,-0.006,0.004
+[CP] GD&T pto de superficie 205- 0,CP,0,0.03,0.03,0.066,0.031,0.071,0.026,0.047,0.057,0.069,0.073,0.069,0.06,0.017,0.099,0.02,0.057,0.052,0.016,0.048,0.004,0.05,0.021,0.026,0.071,0.023,0.051,0.037,0.079,0.05,0.001,0.037,0.092,0.03,0.062,0.037,0.055,0.059,0.059
+[CP] GD&T pto de superficie 206- 0,CP,0,0.03,0.03,0.064,0.023,0.077,0.04,0.094,0.058,0.066,0.085,0.066,0.077,0.028,0.104,0.022,0.057,0.062,0.02,0.064,0.011,0.045,0.044,0.048,0.079,0.028,0.023,0.019,0.045,0.017,0.021,0.019,0.097,0.023,0.075,0.028,0.054,0.059,0.069
+[CP] GD&T pto de superficie 207- 0,CP,0,0.03,0.03,-0.037,-0.026,-0.001,0.004,-0.007,-0.011,-0.029,-0.009,-0.029,-0.034,-0.017,-0.019,-0.013,-0.015,-0.034,-0.015,-0.028,-0.005,-0.001,-0.016,0.002,-0.008,-0.004,-0.05,-0.036,-0.034,-0.025,0.007,-0.036,-0.011,-0.009,-0.024,-0.005,-0.006,0.017,0.018
+[CP] GD&T pto de superficie 208- 0,CP,0,0.03,0.03,0.022,0.045,0.01,0.034,0.032,0.017,0.041,0.007,0.041,0.009,0.032,0.019,0.03,0.037,0.022,0.024,0.009,0.036,0.036,0.004,0.02,-0.007,0.026,0.023,0.022,0.02,0.034,0.022,0.022,0.021,0.03,0.028,0.051,0.04,0.043,0.044
+[CP] GD&T pto de superficie 209- 0,CP,0,0.03,0.03,-0.034,-0.061,-0.092,-0.068,-0.053,-0.056,-0.054,-0.088,-0.054,-0.078,-0.089,-0.082,-0.102,-0.099,-0.056,-0.045,-0.104,-0.114,-0.099,-0.034,-0.08,-0.119,-0.073,-0.022,-0.11,-0.125,-0.084,-0.106,-0.11,-0.09,-0.075,-0.113,-0.105,-0.098,-0.121,-0.123
+[CP] GD&T pto de superficie 210- 0,CP,0,0.03,0.03,-0.066,-0.094,-0.115,-0.1,-0.084,-0.086,-0.085,-0.119,-0.085,-0.102,-0.118,-0.114,-0.129,-0.128,-0.078,-0.062,-0.114,-0.144,-0.127,-0.06,-0.109,-0.147,-0.101,-0.038,-0.131,-0.152,-0.118,-0.128,-0.131,-0.109,-0.108,-0.14,-0.136,-0.134,-0.155,-0.149
+[CP] GD&T pto de superficie 211- 0,CP,0,0.03,0.03,-0.072,-0.104,-0.108,-0.101,-0.086,-0.091,-0.096,-0.123,-0.096,-0.101,-0.117,-0.115,-0.128,-0.124,-0.077,-0.066,-0.112,-0.149,-0.13,-0.063,-0.112,-0.148,-0.113,-0.044,-0.135,-0.157,-0.122,-0.129,-0.135,-0.109,-0.128,-0.136,-0.14,-0.144,-0.162,-0.145
+[CP] GD&T pto de superficie 212- 0,CP,0,0.03,0.03,-0.059,-0.09,-0.092,-0.079,-0.07,-0.079,-0.081,-0.096,-0.081,-0.076,-0.086,-0.092,-0.105,-0.091,-0.064,-0.049,-0.101,-0.128,-0.112,-0.048,-0.079,-0.126,-0.085,-0.04,-0.107,-0.137,-0.107,-0.121,-0.107,-0.107,-0.113,-0.096,-0.104,-0.113,-0.13,-0.107
+[CP] GD&T pto de superficie 213- 0,CP,0,0.03,0.03,-0.02,-0.051,-0.058,-0.027,-0.023,-0.042,-0.064,-0.054,-0.064,-0.025,-0.031,-0.067,-0.06,-0.049,-0.025,-0.011,-0.067,-0.075,-0.069,-0.022,-0.038,-0.1,-0.042,-0.024,-0.055,-0.085,-0.07,-0.087,-0.055,-0.089,-0.072,-0.041,-0.058,-0.053,-0.077,-0.054
+[CP] GD&T pto de superficie 214- 0,CP,0,0.03,0.03,-0.008,0.01,0.043,0.008,0.012,0.017,0.04,0.027,0.04,0.01,-0.005,0.018,0.03,0.022,0.001,-0.007,0.056,0.026,0.036,0.01,0.005,0.049,0.004,0.057,0.049,0.049,0.014,0.022,0.049,0.01,-0.015,0.044,0.033,0.017,0.05,0.061
+[CP] GD&T pto de superficie 215- 0,CP,0,0.03,0.03,-0.008,0.012,0.032,0.001,0.002,0.015,0.039,0.018,0.039,0.012,-0.01,0.014,0.026,0.012,0,-0.005,0.054,0.02,0.032,0.007,-0.002,0.046,-0.003,0.058,0.041,0.042,0.005,0.022,0.041,0.016,-0.014,0.034,0.029,0.011,0.04,0.048
+[CP] GD&T pto de superficie 216- 0,CP,0,0.03,0.03,0,0.023,0.038,0.003,0.008,0.025,0.045,0.016,0.045,0.02,-0.005,0.019,0.031,0.015,0.009,0.001,0.056,0.023,0.038,0.008,-0.003,0.05,-0.003,0.066,0.044,0.051,0.015,0.027,0.044,0.026,-0.002,0.034,0.031,0.017,0.04,0.045
+[CP] GD&T pto de superficie 217- 0,CP,0,0.03,0.03,0.009,0.034,0.046,0.011,0.017,0.036,0.055,0.016,0.055,0.022,0,0.028,0.035,0.017,0.011,0.002,0.054,0.04,0.043,0,-0.009,0.044,-0.004,0.064,0.045,0.061,0.027,0.023,0.045,0.028,0.011,0.034,0.031,0.016,0.044,0.037
+[CP] GD&T pto de superficie 218- 0,CP,0,0.03,0.03,0.016,0.044,0.051,0.025,0.025,0.041,0.059,0.026,0.059,0.025,0.011,0.045,0.046,0.033,0.013,0.003,0.056,0.056,0.054,-0.001,-0.01,0.047,0.001,0.052,0.044,0.069,0.039,0.026,0.044,0.036,0.024,0.028,0.03,0.018,0.044,0.035
+[CP] GD&T pto de superficie 219- 0,CP,0,0.03,0.03,-0.046,-0.056,-0.078,-0.06,-0.066,-0.039,-0.03,-0.054,-0.03,-0.048,-0.068,-0.046,-0.084,-0.083,-0.03,-0.026,-0.06,-0.089,-0.081,-0.065,-0.091,-0.102,-0.075,-0.021,-0.085,-0.105,-0.08,-0.101,-0.085,-0.082,-0.092,-0.086,-0.09,-0.095,-0.102,-0.096
+[CP] GD&T pto de superficie 220- 0,CP,0,0.03,0.03,-0.074,-0.091,-0.104,-0.095,-0.107,-0.068,-0.061,-0.085,-0.061,-0.073,-0.099,-0.087,-0.114,-0.12,-0.054,-0.044,-0.076,-0.125,-0.116,-0.091,-0.126,-0.136,-0.117,-0.025,-0.101,-0.13,-0.126,-0.131,-0.101,-0.112,-0.15,-0.119,-0.13,-0.142,-0.146,-0.132
+[CP] GD&T pto de superficie 221- 0,CP,0,0.03,0.03,-0.088,-0.11,-0.108,-0.105,-0.129,-0.079,-0.075,-0.094,-0.075,-0.078,-0.105,-0.1,-0.12,-0.124,-0.069,-0.055,-0.087,-0.141,-0.131,-0.1,-0.136,-0.149,-0.136,-0.033,-0.107,-0.135,-0.145,-0.145,-0.107,-0.124,-0.176,-0.124,-0.14,-0.16,-0.16,-0.142
+[CP] GD&T pto de superficie 222- 0,CP,0,0.03,0.03,-0.091,-0.112,-0.109,-0.112,-0.117,-0.091,-0.088,-0.103,-0.088,-0.08,-0.106,-0.106,-0.121,-0.121,-0.083,-0.068,-0.102,-0.154,-0.138,-0.097,-0.129,-0.152,-0.125,-0.07,-0.114,-0.143,-0.136,-0.14,-0.114,-0.132,-0.158,-0.123,-0.132,-0.152,-0.151,-0.128
+[CP] GD&T pto de superficie 223- 0,CP,0,0.03,0.03,-0.079,-0.085,-0.085,-0.079,-0.093,-0.081,-0.073,-0.077,-0.073,-0.051,-0.068,-0.084,-0.09,-0.075,-0.062,-0.043,-0.076,-0.098,-0.104,-0.079,-0.084,-0.12,-0.086,-0.052,-0.078,-0.094,-0.107,-0.14,-0.078,-0.126,-0.133,-0.081,-0.087,-0.105,-0.107,-0.091
+[CP] GD&T pto de superficie 224- 0,CP,0,0.03,0.03,0.029,0.033,0.035,0.019,0.036,0.034,0.027,0.031,0.027,0.03,0,0.003,0.036,0.033,0.04,0.036,0.069,0.04,0.062,0.031,0.031,0.046,0.018,0.07,0.061,0.054,0.024,0.043,0.061,0.003,-0.003,0.043,0.039,0.035,0.038,0.062
+[CP] GD&T pto de superficie 225- 0,CP,0,0.03,0.03,0.044,0.055,0.039,0.026,0.034,0.055,0.044,0.044,0.044,0.054,0.013,0.015,0.051,0.033,0.056,0.058,0.084,0.042,0.068,0.041,0.043,0.062,0.018,0.089,0.082,0.072,0.027,0.064,0.082,0.023,0.011,0.058,0.056,0.049,0.044,0.067
+[CP] GD&T pto de superficie 226- 0,CP,0,0.03,0.03,0.048,0.065,0.045,0.029,0.035,0.065,0.057,0.052,0.057,0.065,0.022,0.029,0.059,0.031,0.067,0.067,0.091,0.043,0.069,0.044,0.045,0.071,0.017,0.098,0.093,0.083,0.034,0.074,0.093,0.036,0.021,0.066,0.064,0.055,0.047,0.064
+[CP] GD&T pto de superficie 227- 0,CP,0,0.03,0.03,0.032,0.052,0.041,0.023,0.031,0.059,0.048,0.042,0.048,0.051,0.019,0.032,0.05,0.028,0.046,0.05,0.076,0.047,0.063,0.032,0.017,0.056,0.005,0.075,0.074,0.077,0.036,0.047,0.074,0.025,0.019,0.054,0.038,0.042,0.035,0.045
+[CP] GD&T pto de superficie 228- 0,CP,0,0.03,0.03,0.035,0.042,0.033,0.031,0.033,0.052,0.035,0.037,0.035,0.05,0.014,0.029,0.048,0.029,0.032,0.037,0.063,0.057,0.06,0.03,0.018,0.05,0.009,0.056,0.061,0.075,0.035,0.049,0.061,0.03,0.014,0.03,0.022,0.024,0.023,0.029
+[CP] GD&T pto de superficie 229- 0,CP,0,0.03,0.03,0.046,0.023,-0.015,0.002,0.009,0.017,0.04,0.021,0.04,0.078,0.101,0.054,0.019,0.037,0.008,0.018,-0.043,-0.008,0.014,0.013,0.028,0,0.022,-0.019,-0.019,-0.002,-0.019,0.053,-0.019,0.087,0.08,0.022,0.04,0.012,0.001,0.013
+[CP] GD&T pto de superficie 230- 0,CP,0,0.03,0.03,0.057,0.038,0.003,0.019,0.023,0.032,0.044,0.039,0.044,0.1,0.129,0.059,0.038,0.059,0.026,0.036,-0.026,0.008,0.032,0.026,0.049,0.017,0.044,-0.02,0.001,0.017,-0.009,0.072,0.001,0.096,0.087,0.059,0.075,0.045,0.031,0.05
+[CP] GD&T pto de superficie 231- 0,CP,0,0.03,0.03,0.044,0.031,0.001,0.019,0.017,0.021,0.027,0.034,0.027,0.093,0.128,0.047,0.046,0.065,0.022,0.034,-0.021,0.01,0.03,0.025,0.051,0.013,0.043,-0.025,-0.003,0.006,-0.021,0.059,-0.003,0.08,0.063,0.063,0.075,0.046,0.033,0.055
+[CP] GD&T pto de superficie 232- 0,CP,0,0.03,0.03,-0.008,-0.02,-0.027,-0.015,-0.018,-0.022,-0.011,-0.007,-0.011,0.044,0.088,0.002,0.013,0.034,-0.02,-0.009,-0.054,-0.023,-0.008,-0.006,0.014,-0.021,0.011,-0.057,-0.036,-0.034,-0.048,0.016,-0.036,0.04,0.027,0.024,0.041,0.01,0.014,0.028
+[CP] GD&T pto de superficie 233- 0,CP,0,0.03,0.03,0.004,-0.008,-0.012,-0.005,-0.003,-0.007,0.004,0.005,0.004,0.063,0.102,0.007,0.028,0.046,-0.005,0.011,-0.038,-0.016,0.003,0.007,0.029,-0.011,0.023,-0.022,-0.015,-0.021,-0.04,0.036,-0.015,0.053,0.036,0.049,0.062,0.023,0.032,0.049
+[CP] GD&T pto de superficie 234- 0,CP,0,0.03,0.03,-0.037,-0.02,0.028,0.005,-0.009,-0.008,-0.037,-0.013,-0.037,-0.04,-0.054,-0.042,0.017,0.002,-0.022,-0.038,0.033,0.001,-0.025,-0.008,-0.017,0.013,-0.008,-0.009,0.015,-0.001,0.009,-0.034,0.015,-0.057,-0.052,-0.012,-0.034,-0.008,0.005,-0.009
+[CP] GD&T pto de superficie 235- 0,CP,0,0.03,0.03,-0.036,-0.021,0.018,-0.005,-0.014,-0.011,-0.032,-0.017,-0.032,-0.049,-0.066,-0.041,0.002,-0.008,-0.029,-0.046,0.022,-0.008,-0.032,-0.017,-0.033,0.001,-0.022,-0.007,0.002,-0.008,0.003,-0.04,0.002,-0.063,-0.055,-0.027,-0.047,-0.015,-0.006,-0.025
+[CP] GD&T pto de superficie 236- 0,CP,0,0.03,0.03,-0.036,-0.025,0.007,-0.015,-0.02,-0.018,-0.032,-0.025,-0.032,-0.063,-0.084,-0.039,-0.012,-0.017,-0.036,-0.056,0.01,-0.021,-0.042,-0.03,-0.049,-0.009,-0.034,-0.015,-0.013,-0.02,-0.002,-0.047,-0.013,-0.062,-0.054,-0.042,-0.057,-0.023,-0.015,-0.034
+[CP] GD&T pto de superficie 237- 0,CP,0,0.03,0.03,-0.077,-0.07,-0.037,-0.084,-0.064,-0.071,-0.076,-0.071,-0.076,-0.113,-0.139,-0.075,-0.068,-0.062,-0.081,-0.106,-0.038,-0.082,-0.079,-0.09,-0.11,-0.047,-0.082,-0.068,-0.077,-0.07,-0.041,-0.094,-0.077,-0.089,-0.091,-0.108,-0.11,-0.073,-0.082,-0.085
+[CP] GD&T pto de superficie 238- 0,CP,0,0.03,0.03,-0.036,-0.03,-0.008,-0.045,-0.027,-0.036,-0.035,-0.032,-0.035,-0.073,-0.106,-0.031,-0.034,-0.032,-0.042,-0.063,0.003,-0.035,-0.04,-0.054,-0.075,-0.02,-0.055,-0.027,-0.044,-0.024,0.007,-0.038,-0.044,-0.039,-0.044,-0.067,-0.067,-0.028,-0.041,-0.05
+[CP] GD&T pto de superficie 239- 0,CP,0,0.03,0.03,-0.052,-0.063,-0.061,-0.048,-0.05,-0.055,-0.046,-0.06,-0.046,-0.045,-0.011,-0.028,-0.056,-0.052,-0.064,-0.062,-0.091,-0.06,-0.074,-0.064,-0.07,-0.081,-0.055,-0.096,-0.094,-0.08,-0.059,-0.043,-0.094,-0.002,0,-0.061,-0.052,-0.06,-0.053,-0.07
+[CP] GD&T pto de superficie 240- 0,CP,0,0.03,0.03,-0.071,-0.085,-0.072,-0.06,-0.05,-0.077,-0.073,-0.08,-0.073,-0.061,-0.016,-0.042,-0.062,-0.046,-0.081,-0.086,-0.109,-0.065,-0.083,-0.066,-0.072,-0.086,-0.045,-0.118,-0.115,-0.097,-0.065,-0.062,-0.115,-0.01,-0.014,-0.065,-0.056,-0.064,-0.05,-0.066
+[CP] GD&T pto de superficie 241- 0,CP,0,0.03,0.03,-0.081,-0.1,-0.081,-0.065,-0.053,-0.09,-0.095,-0.097,-0.095,-0.068,-0.021,-0.066,-0.063,-0.04,-0.094,-0.099,-0.121,-0.068,-0.085,-0.069,-0.076,-0.093,-0.041,-0.127,-0.125,-0.107,-0.071,-0.075,-0.125,-0.025,-0.028,-0.066,-0.057,-0.067,-0.046,-0.061
+[CP] GD&T pto de superficie 242- 0,CP,0,0.03,0.03,-0.075,-0.093,-0.081,-0.067,-0.062,-0.084,-0.09,-0.078,-0.09,-0.049,0.002,-0.069,-0.055,-0.021,-0.084,-0.079,-0.108,-0.065,-0.061,-0.059,-0.071,-0.091,-0.036,-0.107,-0.099,-0.088,-0.079,-0.06,-0.099,-0.028,-0.025,-0.04,-0.032,-0.048,-0.033,-0.033
+[CP] GD&T pto de superficie 243- 0,CP,0,0.03,0.03,-0.049,-0.056,-0.059,-0.046,-0.035,-0.059,-0.063,-0.047,-0.063,-0.008,0.036,-0.055,-0.026,0.004,-0.059,-0.043,-0.078,-0.044,-0.038,-0.041,-0.024,-0.064,-0.006,-0.059,-0.049,-0.052,-0.051,-0.031,-0.049,-0.01,0.008,0.002,0.007,-0.015,0.011,0.008
+[CP] GD&T pto de superficie 244- 0,CP,0,0.03,0.03,-0.057,-0.05,-0.014,-0.063,-0.061,-0.059,-0.062,-0.036,-0.062,-0.05,-0.051,-0.076,-0.016,-0.01,-0.039,-0.069,-0.025,-0.049,-0.043,-0.021,-0.03,0,-0.018,-0.049,-0.033,-0.047,-0.039,-0.056,-0.033,-0.088,-0.073,-0.06,-0.074,-0.054,-0.058,-0.047
+[CP] GD&T pto de superficie 245- 0,CP,0,0.03,0.03,-0.034,-0.024,-0.001,-0.05,-0.049,-0.034,-0.039,-0.014,-0.039,-0.038,-0.042,-0.061,-0.011,-0.007,-0.026,-0.061,-0.019,-0.04,-0.041,-0.006,-0.034,-0.001,-0.017,-0.026,-0.031,-0.041,-0.035,-0.051,-0.031,-0.088,-0.069,-0.066,-0.074,-0.055,-0.06,-0.056
+[CP] GD&T pto de superficie 246- 0,CP,0,0.03,0.03,-0.035,-0.026,-0.013,-0.059,-0.054,-0.037,-0.037,-0.022,-0.037,-0.047,-0.054,-0.061,-0.028,-0.018,-0.032,-0.071,-0.031,-0.055,-0.048,-0.017,-0.055,-0.015,-0.032,-0.029,-0.045,-0.05,-0.042,-0.062,-0.045,-0.087,-0.076,-0.088,-0.082,-0.066,-0.073,-0.069
+[CP] GD&T pto de superficie 247- 0,CP,0,0.03,0.03,-0.082,-0.064,-0.048,-0.1,-0.084,-0.073,-0.074,-0.066,-0.074,-0.091,-0.124,-0.086,-0.076,-0.051,-0.069,-0.108,-0.066,-0.089,-0.077,-0.086,-0.113,-0.052,-0.074,-0.089,-0.101,-0.091,-0.075,-0.09,-0.101,-0.116,-0.098,-0.124,-0.129,-0.089,-0.096,-0.088
+[CP] GD&T pto de superficie 248- 0,CP,0,0.03,0.03,-0.069,-0.054,-0.031,-0.087,-0.065,-0.058,-0.055,-0.054,-0.055,-0.076,-0.108,-0.052,-0.066,-0.044,-0.063,-0.085,-0.04,-0.069,-0.056,-0.072,-0.098,-0.037,-0.07,-0.063,-0.087,-0.067,-0.043,-0.07,-0.087,-0.074,-0.086,-0.095,-0.094,-0.062,-0.071,-0.069
+[CP] GD&T pto de superficie 249- 0,CP,0,0.03,0.03,-0.045,-0.036,-0.04,-0.033,-0.036,-0.048,-0.038,-0.044,-0.038,-0.053,-0.05,-0.022,-0.04,-0.042,-0.043,-0.038,-0.044,-0.039,-0.046,-0.045,-0.038,-0.042,-0.046,-0.05,-0.027,-0.05,-0.039,-0.043,-0.027,-0.044,-0.05,-0.054,-0.046,-0.056,-0.038,-0.048
+[CP] GD&T pto de superficie 250- 0,CP,0,0.03,0.03,-0.029,0.007,0.027,0.071,0.013,0.02,0.014,0.049,0.015,-0.001,-0.001,0.039,0.03,0.024,-0.008,0.006,0.025,0.045,0.019,0.004,-0.021,-0.027,0.017,0.011,0.068,0.042,0.01,0.002,0.068,0.003,-0.048,0.055,0.034,0.011,0.094,0.076
+[CP] GD&T pto de superficie 251- 0,CP,0,0.03,0.03,0,0,0,0.03,0.039,0.036,0.054,0.074,0.052,0.048,0.062,0.048,0.061,0.078,0.041,0.049,0.062,0.062,0.073,0.042,0.053,0.07,0.066,0.046,0.034,0.073,0.061,0.029,0.034,0.072,0.078,0.06,0.06,0.074,0.044,0.079
+[CP] GD&T pto de superficie 252- 0,CP,0,0.03,0.03,-0.003,0.048,0.047,0.057,0.067,-0.005,0.008,0.026,0.008,0.053,0.049,-0.005,0.005,0.015,0.057,0.043,0.039,0.028,0.017,0.025,-0.068,-0.063,0.003,-0.022,-0.026,-0.011,0.131,0.034,-0.026,0.042,-0.032,0.078,0.111,0.115,0.091,0.091
+[CP] GD&T pto de superficie 253- 0,CP,0,0.03,0.03,0.035,-0.011,-0.008,-0.062,0.028,-0.021,-0.013,-0.042,-0.013,0.008,0.02,-0.032,-0.009,0.012,0.005,0.008,-0.009,-0.018,0.006,-0.007,0.033,0.049,0.008,-0.009,-0.054,-0.025,0.008,-0.027,-0.054,0.02,0.073,-0.035,-0.009,0.027,-0.067,-0.018
+[CP] GD&T pto de superficie 254- 0,CP,0,0.03,0.03,0.052,0,-0.02,-0.041,0.033,-0.006,-0.065,-0.099,-0.065,0.064,0.054,-0.081,-0.032,0.006,-0.013,-0.03,-0.053,-0.045,-0.03,0.04,0.054,0.047,0.004,-0.01,-0.099,-0.089,-0.071,0.045,-0.099,0.033,0.062,0.024,0.03,0.064,-0.034,-0.001
+[CP] GD&T pto de superficie 255- 0,CP,0,0.03,0.03,0.085,0.098,0.095,0.128,0.099,0.058,0.093,0.086,0.093,0.049,0.101,0.069,0.125,0.11,0.054,0.052,0.049,0.089,0.081,0.07,0.079,0.082,0.108,0.058,0.08,0.088,0.08,0.049,0.08,0.107,0.107,0.014,0.04,0.048,0.104,0.083
+[CP] GD&T pto de superficie 256- 0,CP,0,0.03,0.03,0.023,0.028,0.014,0.08,0.016,0.021,0.03,0.038,0.03,0.137,-0.013,-0.011,0.063,0.057,0.012,0.019,0.032,-0.014,-0.007,0.006,-0.002,0.032,-0.001,0.059,0.076,0.072,0.043,0.076,0.076,0.091,0.072,0.017,-0.004,0.015,0.009,-0.002
+[CP] GD&T pto de superficie 257- 0,CP,0,0.03,0.03,-0.05,-0.052,-0.053,-0.056,-0.052,-0.049,-0.054,-0.052,-0.054,-0.047,-0.043,-0.044,-0.048,0.021,-0.049,-0.051,-0.053,0.042,-0.051,-0.045,-0.045,-0.048,-0.049,-0.057,-0.061,-0.06,-0.057,-0.058,-0.061,-0.043,-0.054,-0.049,-0.057,-0.054,-0.05,-0.053
+[CP] GD&T pto de superficie 258- 0,CP,0,0.03,0.03,-0.095,-0.12,-0.069,-0.103,-0.077,-0.073,-0.094,-0.081,-0.094,-0.066,-0.062,-0.154,-0.1,-0.086,-0.095,-0.099,-0.103,-0.104,-0.082,-0.14,-0.076,-0.069,-0.122,-0.166,-0.204,-0.171,-0.155,-0.193,-0.204,-0.141,-0.144,-0.153,-0.105,-0.112,-0.134,-0.108
+[CP] GD&T pto de superficie 259- 0,CP,0,0.03,0.03,0.002,-0.008,0.002,0.002,-0.003,-0.001,-0.005,-0.005,-0.005,-0.005,-0.002,-0.006,0.001,0,-0.011,-0.005,-0.001,-0.002,-0.003,-0.001,-0.006,-0.005,-0.017,-0.003,-0.001,-0.003,-0.003,-0.035,-0.001,-0.007,-0.01,0.001,-0.003,-0.001,-0.003,-0.005
+[CP] GD&T pto de superficie 260- 0,CP,0,0.03,0.03,-0.047,-0.035,-0.03,-0.056,-0.048,-0.043,-0.036,-0.039,-0.036,-0.02,-0.012,-0.037,-0.019,-0.015,-0.054,-0.052,-0.039,-0.046,-0.045,-0.089,-0.083,-0.08,-0.084,-0.04,-0.039,-0.036,-0.038,-0.103,-0.039,-0.056,-0.069,-0.046,-0.041,-0.048,-0.04,-0.039
+[CP] GD&T pto de superficie 261- 0,CP,0,0.023,0.023,0.063,0.081,0.088,0.122,0.087,0.093,0.054,0.074,0.054,0.091,0.089,0.07,0.125,0.121,0.038,0.057,0.074,0.103,0.067,0.064,0.06,0.064,0.082,0.074,0.136,0.117,0.107,0.074,0.136,0.068,0.059,0.128,0.119,0.093,0.146,0.146
+[CP] GD&T pto de superficie 262- 0,CP,0,0.023,0.023,0.044,0.061,0.078,0.092,0.065,0.071,0.045,0.046,0.045,0.055,0.061,0.059,0.087,0.066,0.021,0.027,0.04,0.06,0.04,0.039,0.022,0.048,0.047,0.054,0.061,0.049,0.057,0.037,0.061,0.057,0.022,0.065,0.061,0.06,0.077,0.068
+[CP] GD&T pto de superficie 263- 0,CP,0,0.023,0.023,0.139,0.15,0.149,0.125,0.136,0.156,0.098,0.151,0.098,0.145,0.18,0.141,0.159,0.141,0.108,0.1,0.128,0.124,0.098,0.052,0.086,0.121,0.102,0.022,0.107,0.09,0.094,0.111,0.107,0.097,0.076,0.109,0.137,0.143,0.149,0.124
+[CP] GD&T pto de superficie 264- 0,CP,0,0.023,0.023,-0.083,-0.043,-0.016,-0.008,-0.054,-0.036,-0.042,-0.04,-0.042,-0.054,-0.041,-0.035,-0.028,-0.03,-0.059,-0.042,0.001,-0.022,-0.043,-0.09,-0.086,-0.066,-0.061,-0.055,0.009,-0.046,-0.056,-0.077,0.009,-0.057,-0.121,-0.008,-0.007,-0.028,0.028,0.044
+[CP] GD&T pto de superficie 265- 0,CP,0,0.023,0.023,-0.092,-0.064,-0.037,-0.046,-0.068,-0.055,-0.079,-0.086,-0.079,-0.078,-0.069,-0.084,-0.059,-0.059,-0.078,-0.064,-0.02,-0.059,-0.067,-0.136,-0.123,-0.109,-0.109,-0.06,-0.023,-0.057,-0.068,-0.122,-0.023,-0.091,-0.131,-0.05,-0.044,-0.067,-0.02,0.001
+[CP] GD&T pto de superficie 266- 0,CP,0,0.023,0.023,-0.075,-0.063,-0.037,-0.044,-0.065,-0.052,-0.078,-0.085,-0.078,-0.066,-0.059,-0.079,-0.048,-0.049,-0.089,-0.077,-0.035,-0.082,-0.08,-0.132,-0.125,-0.117,-0.128,-0.064,-0.022,-0.043,-0.061,-0.147,-0.022,-0.105,-0.135,-0.064,-0.055,-0.072,-0.042,-0.023
+[CP] GD&T pto de superficie 267- 0,CP,0,0.023,0.023,0.028,0.048,0.054,0.064,0.051,0.043,0.009,0.016,0.009,0.052,0.055,0.026,0.084,0.072,0.014,0.025,0.032,0.047,0.02,0.032,0.022,0.023,0.028,0.035,0.069,0.038,0.07,0.045,0.069,0.025,0.008,0.059,0.068,0.045,0.073,0.077
+[CP] GD&T pto de superficie 268- 0,CP,0,0.023,0.023,0.034,0.045,0.044,0.058,0.056,0.05,0.001,-0.022,0.001,0.03,0.019,-0.001,0.056,0.053,0.005,0.011,0.015,0.017,0.014,0.031,0.001,0.012,0.01,0.023,0.018,-0.008,0.022,0.015,0.018,-0.006,-0.021,0.022,0.021,0.011,0.027,0.035
+[CP] GD&T pto de superficie 269- 0,CP,0,0.023,0.023,0.029,0.027,0.027,0.022,0.028,0.029,-0.02,-0.002,-0.02,0.051,0.041,-0.007,0.048,0.051,-0.001,-0.007,0.002,-0.002,-0.011,0.011,0.007,0.027,0.016,-0.016,-0.012,-0.023,0.007,0.008,-0.012,-0.007,-0.009,0.01,0.005,0.011,0.004,0.016
+[CP] GD&T pto de superficie 270- 0,CP,0,0.023,0.023,-0.033,-0.02,-0.006,-0.027,-0.028,-0.038,-0.026,-0.032,-0.026,-0.03,-0.023,-0.021,-0.038,-0.02,-0.029,-0.03,-0.027,-0.036,-0.028,-0.019,-0.033,-0.034,-0.035,-0.054,-0.023,-0.053,-0.036,-0.05,-0.023,-0.05,-0.057,-0.045,-0.031,-0.038,-0.036,-0.025
+[CP] GD&T pto de superficie 271- 0,CP,0,0.023,0.023,-0.054,-0.057,-0.03,-0.051,-0.046,-0.062,-0.055,-0.056,-0.055,-0.056,-0.05,-0.047,-0.071,-0.042,-0.063,-0.063,-0.049,-0.067,-0.054,-0.056,-0.055,-0.045,-0.06,-0.087,-0.077,-0.089,-0.071,-0.083,-0.077,-0.066,-0.096,-0.09,-0.087,-0.084,-0.084,-0.066
+[CP] GD&T pto de superficie 272- 0,CP,0,0.023,0.023,-0.053,-0.077,-0.047,-0.068,-0.054,-0.062,-0.068,-0.056,-0.068,-0.059,-0.058,-0.07,-0.087,-0.06,-0.075,-0.087,-0.057,-0.079,-0.065,-0.051,-0.061,-0.051,-0.079,-0.109,-0.121,-0.111,-0.109,-0.108,-0.121,-0.089,-0.124,-0.12,-0.108,-0.094,-0.109,-0.091
+[CP] GD&T pto de superficie 273- 0,CP,0,0.02,0.02,-0.011,0.013,0.025,0.05,0.017,0.01,0.007,0.02,0.007,0.007,0.012,0.019,0.03,0.038,-0.001,0.008,0.018,0.037,0.009,0.007,-0.012,-0.01,0.018,0.019,0.076,0.03,0.03,0.032,0.076,0.004,-0.009,0.078,0.056,0.039,0.077,0.084
+[CP] GD&T pto de superficie 274- 0,CP,0,0.02,0.02,-0.025,0.017,0.054,0.029,0.007,0.002,0.007,0.021,0.007,-0.011,0.01,0.024,0.007,0.021,-0.011,0.003,0.044,0.013,-0.007,0.013,-0.004,0.024,0.008,-0.005,0.07,0.032,0.015,0.006,0.07,0.004,-0.021,0.048,0.061,0.04,0.052,0.058
+[CP] GD&T pto de superficie 275- 0,CP,0,0.02,0.02,-0.028,-0.008,0.003,0.035,0.006,-0.007,-0.015,-0.003,-0.015,-0.004,-0.012,0.004,0.033,0.033,-0.022,-0.014,0.004,0.024,-0.008,-0.008,-0.029,-0.017,0.007,0.004,0.055,0.015,0.021,0.003,0.055,-0.006,-0.032,0.054,0.041,0.024,0.068,0.079
+[CP] GD&T pto de superficie 276- 0,CP,0,0.02,0.02,-0.051,0.002,0.023,0.013,-0.017,-0.018,-0.009,-0.004,-0.009,-0.034,-0.016,0.004,-0.006,0.016,-0.031,-0.022,0.018,-0.003,-0.025,-0.012,-0.023,-0.001,0.001,-0.041,0.048,0.007,0.009,-0.023,0.048,-0.004,-0.025,0.024,0.039,0.018,0.043,0.05
+[CP] GD&T pto de superficie 277- 0,CP,0,0.02,0.02,-0.037,-0.018,0.005,0.016,-0.003,-0.008,-0.011,-0.006,-0.011,-0.003,-0.005,0.004,0.042,0.024,-0.02,-0.012,0.005,0.011,-0.008,-0.017,-0.029,-0.022,-0.008,-0.002,0.037,0.018,0.02,0.006,0.037,0.005,-0.025,0.041,0.046,0.025,0.058,0.069
+[CP] GD&T pto de superficie 278- 0,CP,0,0.02,0.02,-0.035,-0.02,0.005,0.012,0.005,-0.019,-0.011,-0.011,-0.011,-0.011,-0.011,0.008,0.026,0.039,-0.03,-0.018,0.002,0.005,-0.006,-0.004,-0.021,-0.007,0.003,-0.012,0.028,0.001,0.019,-0.01,0.028,-0.007,-0.024,0.032,0.031,0.016,0.053,0.063
+[CP] GD&T pto de superficie 279- 0,CP,0,0.02,0.02,-0.035,-0.029,-0.008,-0.004,-0.003,-0.016,-0.014,-0.01,-0.014,-0.003,-0.003,0,0.032,0.03,-0.031,-0.028,-0.009,-0.01,-0.015,-0.027,-0.031,-0.022,-0.012,-0.029,0.006,-0.012,0.002,-0.004,0.006,0.003,-0.024,0.018,0.027,0.01,0.034,0.043
+[CP] GD&T pto de superficie 280- 0,CP,0,0.02,0.02,-0.029,-0.022,-0.003,-0.001,-0.002,-0.022,-0.013,-0.009,-0.013,-0.012,-0.014,0.003,0.009,0.029,-0.039,-0.03,-0.01,-0.009,-0.014,-0.016,-0.02,-0.013,-0.001,-0.024,0.006,-0.022,0.007,-0.011,0.006,-0.004,-0.025,0.021,0.02,0.008,0.035,0.048
+[CP] GD&T pto de superficie 281- 0,CP,0,0.02,0.02,-0.037,-0.034,-0.019,-0.02,-0.011,-0.026,-0.022,-0.024,-0.022,-0.028,-0.03,-0.015,-0.007,0.007,-0.039,-0.04,-0.019,-0.026,-0.023,-0.039,-0.041,-0.028,-0.024,-0.052,-0.025,-0.036,-0.015,-0.021,-0.025,-0.012,-0.033,-0.002,-0.004,-0.013,-0.003,0.017
+[CP] GD&T pto de superficie 282- 0,CP,0,0.02,0.02,-0.037,-0.033,-0.013,-0.02,-0.014,-0.027,-0.028,-0.021,-0.028,-0.048,-0.046,-0.016,-0.024,-0.006,-0.049,-0.048,-0.021,-0.029,-0.029,-0.042,-0.042,-0.029,-0.024,-0.048,-0.028,-0.048,-0.018,-0.034,-0.028,-0.017,-0.037,-0.007,-0.005,-0.015,-0.003,0.013
+[CP] GD&T pto de superficie 283- 0,CP,0,0.02,0.02,-0.061,-0.078,-0.055,-0.074,-0.056,-0.069,-0.072,-0.072,-0.072,-0.051,-0.045,-0.084,-0.035,-0.039,-0.085,-0.088,-0.078,-0.075,-0.072,-0.084,-0.079,-0.085,-0.073,-0.085,-0.099,-0.086,-0.064,-0.084,-0.099,-0.094,-0.086,-0.087,-0.079,-0.087,-0.076,-0.055
+[CP] GD&T pto de superficie 284- 0,CP,0,0.02,0.02,-0.066,-0.062,-0.058,-0.066,-0.049,-0.064,-0.063,-0.065,-0.063,-0.038,-0.026,-0.072,-0.022,-0.02,-0.081,-0.073,-0.072,-0.071,-0.063,-0.079,-0.066,-0.09,-0.067,-0.073,-0.069,-0.08,-0.054,-0.079,-0.069,-0.094,-0.078,-0.082,-0.069,-0.084,-0.075,-0.047
+[CP] GD&T pto de superficie 285- 0,CP,0,0.03,0.03,-0.062,-0.021,-0.045,-0.005,-0.058,-0.048,-0.047,-0.052,-0.047,-0.072,-0.02,-0.076,-0.06,-0.071,-0.055,-0.014,-0.038,0.005,-0.036,-0.017,-0.011,-0.037,-0.02,-0.042,-0.006,-0.045,-0.045,-0.025,-0.006,-0.093,-0.107,-0.073,-0.025,-0.049,-0.043,-0.058
+[CP] GD&T pto de superficie 286- 0,CP,0,0.03,0.03,-0.039,0.036,-0.005,0.013,-0.03,-0.025,-0.015,-0.044,-0.015,-0.018,-0.011,-0.061,-0.035,-0.053,-0.033,0.002,-0.026,0.027,-0.011,0.002,0,-0.038,-0.027,-0.012,0.022,-0.009,0.014,-0.014,0.022,-0.062,-0.038,-0.039,0.013,-0.007,-0.002,-0.036
+[CP] GD&T pto de superficie 287- 0,CP,0,0.03,0.03,-0.014,-0.008,0.025,-0.013,-0.016,-0.027,-0.042,-0.016,-0.042,-0.026,-0.024,-0.045,0.041,0.042,-0.01,-0.024,0.003,-0.012,-0.008,0,0.011,0.016,0.008,-0.02,0.01,-0.008,-0.005,-0.008,0.01,-0.044,-0.033,0.004,-0.006,0.008,0.003,0.013
+[CP] GD&T pto de superficie 288- 0,CP,0,0.03,0.03,0.028,0.045,0.053,0.003,-0.01,0.027,0.008,0.033,0.008,0.02,0.02,-0.039,0.025,0.03,0.044,-0.002,0.028,0.018,0,0.042,0.001,0.024,0.004,0.016,-0.002,-0.015,-0.021,-0.007,-0.002,-0.058,-0.019,-0.016,-0.021,-0.012,-0.018,-0.026
+[CP] GD&T pto de superficie 289- 0,CP,0,0.03,0.03,-0.004,0.006,0.019,-0.021,-0.017,-0.009,0.005,0.007,0.005,-0.025,-0.046,0.003,-0.001,0.007,0.002,-0.026,0.01,-0.011,0.003,-0.016,-0.033,0.008,-0.027,-0.014,-0.032,-0.011,-0.001,-0.018,-0.032,-0.017,-0.029,-0.036,-0.025,0.005,-0.014,-0.016
+[CP] GD&T pto de superficie 290- 0,CP,0,0.03,0.03,-0.038,-0.039,-0.039,-0.024,-0.019,-0.044,-0.035,-0.039,-0.035,-0.009,0.033,-0.034,-0.011,0.004,-0.043,-0.024,-0.05,-0.029,-0.031,-0.025,-0.012,-0.046,0.001,-0.036,-0.033,-0.041,-0.033,-0.013,-0.033,0.014,0.022,0.016,0.022,-0.003,0.022,0.016
+[CP] GD&T pto de superficie 291- 0,CP,0,0.03,0.03,-0.111,-0.124,-0.093,-0.08,-0.059,-0.116,-0.103,-0.113,-0.103,-0.108,-0.047,-0.074,-0.084,-0.056,-0.12,-0.124,-0.137,-0.082,-0.11,-0.09,-0.103,-0.114,-0.057,-0.15,-0.149,-0.127,-0.08,-0.098,-0.149,-0.042,-0.035,-0.099,-0.087,-0.091,-0.064,-0.085
+[CP] GD&T pto de superficie 292- 0,CP,0,0.03,0.03,-0.033,-0.037,-0.049,-0.025,-0.027,-0.023,-0.013,-0.032,-0.013,-0.018,0,0.002,-0.035,-0.034,-0.038,-0.028,-0.055,-0.04,-0.053,-0.054,-0.069,-0.069,-0.054,-0.049,-0.058,-0.04,-0.03,-0.02,-0.058,0.023,0.019,-0.051,-0.044,-0.053,-0.044,-0.062
+[CP] GD&T pto de superficie 293- 0,CP,0,0.03,0.03,0.011,0.005,0.028,0.007,0.025,0.001,-0.015,-0.003,-0.015,-0.012,-0.018,-0.03,0.015,0.014,0.022,0.006,0.041,0.035,0.037,0.028,0.036,0.023,0.011,0.027,0.03,0.023,0.02,0.014,0.03,-0.018,-0.027,0.02,0.01,0,0.01,0.04
+[CP] GD&T pto de superficie 294- 0,CP,0,0.03,0.03,0.06,0.074,0.048,0.037,0.038,0.072,0.057,0.06,0.057,0.073,0.025,0.03,0.063,0.033,0.078,0.081,0.1,0.049,0.077,0.055,0.055,0.075,0.021,0.107,0.104,0.089,0.037,0.081,0.104,0.038,0.024,0.074,0.07,0.067,0.051,0.072
+[CP] GD&T pto de superficie 295- 0,CP,0,0.03,0.03,0.043,0.053,0.041,0.041,0.042,0.056,0.037,0.037,0.037,0.044,0.013,0.032,0.052,0.033,0.06,0.045,0.067,0.062,0.063,0.029,0.019,0.047,0.007,0.052,0.055,0.066,0.042,0.05,0.055,0.027,0.022,0.025,0.028,0.031,0.028,0.028
+[CP] GD&T pto de superficie 296- 0,CP,0,0.03,0.03,-0.037,-0.048,-0.046,-0.041,-0.048,-0.043,-0.046,-0.039,-0.046,-0.016,-0.021,-0.048,-0.046,-0.041,-0.04,-0.016,-0.048,-0.078,-0.071,-0.034,-0.033,-0.071,-0.041,-0.032,-0.047,-0.07,-0.073,-0.082,-0.047,-0.07,-0.076,-0.037,-0.043,-0.052,-0.067,-0.043
+[CP] GD&T pto de superficie 297- 0,CP,0,0.03,0.03,-0.064,-0.081,-0.092,-0.077,-0.102,-0.051,-0.043,-0.064,-0.043,-0.049,-0.075,-0.075,-0.094,-0.105,-0.041,-0.025,-0.057,-0.106,-0.109,-0.068,-0.108,-0.118,-0.092,0,-0.072,-0.105,-0.125,-0.117,-0.072,-0.104,-0.121,-0.098,-0.115,-0.136,-0.132,-0.115
+[CP] GD&T pto de superficie 298- 0,CP,0,0.03,0.03,-0.009,-0.015,-0.053,-0.014,-0.028,-0.004,0.002,-0.011,0.002,0.004,0.001,0.009,-0.026,-0.024,-0.02,-0.001,-0.047,-0.035,-0.038,-0.008,-0.021,-0.029,-0.014,0.022,-0.003,-0.009,-0.004,-0.014,-0.003,0.012,0.026,-0.03,-0.018,-0.016,-0.028,-0.039
+[CP] GD&T pto de superficie 299- 0,CP,0,0.03,0.03,0.022,0.024,0.059,0.04,0.048,0.005,0.041,0.066,0.041,0.039,0.048,0.049,0.079,0.096,0.071,0.052,0.084,0.083,0.085,0.058,0.088,0.07,0.068,0.008,0.044,0.041,0.068,0.086,0.044,0.061,0.066,0.056,0.06,0.07,0.06,0.092
+[CP] GD&T pto de superficie 300- 0,CP,0,0.03,0.03,0.121,0.148,0.146,0.161,0.156,0.117,0.139,0.202,0.139,0.143,0.165,0.184,0.184,0.203,0.135,0.122,0.139,0.191,0.176,0.127,0.183,0.168,0.178,0.024,0.139,0.154,0.156,0.193,0.139,0.168,0.186,0.183,0.197,0.221,0.213,0.228
+[CP] GD&T pto de superficie 301- 0,CP,0,0.03,0.03,0.088,0.095,0.074,0.091,0.092,0.077,0.111,0.133,0.111,0.082,0.078,0.124,0.102,0.109,0.1,0.075,0.09,0.108,0.108,0.099,0.103,0.108,0.121,0.007,0.05,0.063,0.07,0.124,0.05,0.105,0.122,0.102,0.108,0.123,0.128,0.136
+[CP] GD&T pto de superficie 302- 0,CP,0,0.03,0.03,0.066,0.031,0.072,0.028,0.049,0.058,0.071,0.075,0.071,0.061,0.018,0.101,0.02,0.058,0.052,0.015,0.049,0.004,0.05,0.024,0.029,0.074,0.023,0.05,0.037,0.078,0.05,0.002,0.037,0.093,0.029,0.062,0.036,0.056,0.06,0.061
+[CP] GD&T pto de superficie 303- 0,CP,0,0.03,0.03,0.065,0.024,0.078,0.041,0.096,0.06,0.067,0.086,0.067,0.078,0.029,0.105,0.023,0.058,0.063,0.021,0.065,0.012,0.046,0.045,0.049,0.079,0.029,0.024,0.02,0.046,0.017,0.022,0.02,0.098,0.023,0.076,0.029,0.055,0.06,0.07
+[CP] GD&T pto de superficie 304- 0,CP,0,0.03,0.03,-0.012,-0.019,-0.043,0.005,0.011,-0.003,0.01,-0.014,0.01,0.015,0.007,0.018,0.005,0.017,-0.006,0.012,-0.005,-0.002,0.007,-0.027,-0.009,-0.018,0,-0.021,-0.041,-0.022,0.008,0.024,-0.041,0.041,0.038,0.006,0.026,0.007,0.022,0.02
+[CP] GD&T pto de superficie 305- 0,CP,0,0.03,0.03,-0.089,-0.107,-0.064,-0.05,-0.038,-0.082,-0.044,-0.075,-0.044,-0.06,-0.064,0.006,-0.038,-0.023,-0.064,-0.019,-0.032,-0.061,-0.035,-0.107,-0.042,-0.028,-0.041,-0.109,-0.086,-0.079,-0.01,-0.019,-0.086,0.036,0.017,-0.017,0.055,0.002,0.008,0.026
+[CP] GD&T pto de superficie 306- 0,CP,0,0.03,0.03,-0.016,-0.044,-0.013,-0.001,-0.003,-0.021,-0.003,-0.007,-0.003,-0.016,-0.011,0.003,-0.015,-0.011,0.007,0.008,0.009,0.002,0.003,-0.02,0.002,0,0.011,-0.02,-0.016,-0.03,0.028,0.02,-0.016,0.013,0.042,0.031,0.064,0.011,0.024,0.041
+[CP] GD&T pto de superficie 307- 0,CP,0,0.03,0.03,-0.054,-0.067,-0.088,-0.072,-0.075,-0.051,-0.042,-0.066,-0.042,-0.061,-0.078,-0.061,-0.095,-0.097,-0.043,-0.034,-0.072,-0.101,-0.093,-0.069,-0.101,-0.113,-0.084,-0.024,-0.088,-0.11,-0.092,-0.112,-0.088,-0.091,-0.092,-0.103,-0.105,-0.108,-0.117,-0.111
+[CP] GD&T pto de superficie 308- 0,CP,0,0.03,0.03,-0.081,-0.1,-0.111,-0.103,-0.108,-0.078,-0.073,-0.098,-0.073,-0.086,-0.109,-0.099,-0.123,-0.129,-0.065,-0.054,-0.09,-0.137,-0.127,-0.089,-0.128,-0.14,-0.114,-0.034,-0.111,-0.14,-0.131,-0.134,-0.111,-0.115,-0.132,-0.131,-0.139,-0.15,-0.157,-0.141
+[CP] GD&T pto de superficie 309- 0,CP,0,0.03,0.03,-0.088,-0.113,-0.11,-0.108,-0.121,-0.085,-0.081,-0.101,-0.081,-0.087,-0.11,-0.107,-0.125,-0.127,-0.078,-0.063,-0.095,-0.148,-0.137,-0.095,-0.131,-0.146,-0.126,-0.04,-0.113,-0.141,-0.144,-0.143,-0.113,-0.122,-0.152,-0.13,-0.143,-0.16,-0.165,-0.142
+[CP] GD&T pto de superficie 310- 0,CP,0,0.03,0.03,-0.077,-0.092,-0.088,-0.085,-0.105,-0.071,-0.064,-0.073,-0.064,-0.056,-0.076,-0.084,-0.094,-0.095,-0.067,-0.043,-0.074,-0.118,-0.113,-0.076,-0.097,-0.117,-0.091,-0.037,-0.082,-0.111,-0.126,-0.128,-0.082,-0.112,-0.133,-0.091,-0.106,-0.121,-0.128,-0.098
+[CP] GD&T pto de superficie 311- 0,CP,0,0.03,0.03,-0.069,-0.076,-0.073,-0.069,-0.083,-0.067,-0.063,-0.06,-0.063,-0.043,-0.049,-0.071,-0.072,-0.069,-0.067,-0.039,-0.068,-0.101,-0.099,-0.063,-0.065,-0.097,-0.07,-0.05,-0.071,-0.093,-0.105,-0.115,-0.071,-0.099,-0.113,-0.067,-0.076,-0.087,-0.096,-0.07
+[CP] GD&T pto de superficie 312- 0,CP,0,0.03,0.03,0.028,0.035,0.039,0.021,0.035,0.037,0.033,0.036,0.033,0.032,0.004,0.009,0.041,0.033,0.04,0.038,0.072,0.042,0.061,0.034,0.032,0.051,0.016,0.075,0.065,0.059,0.025,0.045,0.065,0.008,-0.001,0.047,0.04,0.035,0.04,0.064
+[CP] GD&T pto de superficie 313- 0,CP,0,0.03,0.03,0.042,0.053,0.044,0.027,0.034,0.054,0.049,0.046,0.049,0.052,0.014,0.021,0.051,0.031,0.053,0.055,0.086,0.042,0.067,0.04,0.039,0.063,0.017,0.09,0.082,0.073,0.027,0.063,0.082,0.028,0.013,0.061,0.057,0.049,0.047,0.069
+[CP] GD&T pto de superficie 314- 0,CP,0,0.03,0.03,0.048,0.065,0.05,0.032,0.037,0.065,0.061,0.053,0.061,0.064,0.023,0.035,0.061,0.032,0.064,0.063,0.092,0.046,0.068,0.044,0.042,0.072,0.018,0.1,0.092,0.085,0.037,0.074,0.092,0.041,0.026,0.07,0.065,0.058,0.052,0.069
+[CP] GD&T pto de superficie 315- 0,CP,0,0.03,0.03,0.043,0.058,0.035,0.031,0.033,0.059,0.045,0.043,0.045,0.057,0.012,0.028,0.055,0.022,0.068,0.059,0.08,0.052,0.061,0.04,0.034,0.059,0.007,0.078,0.078,0.073,0.033,0.064,0.078,0.025,0.015,0.048,0.044,0.046,0.031,0.042
+[CP] GD&T pto de superficie 316- 0,CP,0,0.03,0.03,0.014,0.025,0.013,0.012,0.013,0.03,0.012,0.01,0.012,0.018,-0.014,0.004,0.026,0.004,0.034,0.019,0.042,0.032,0.035,0.003,-0.008,0.022,-0.021,0.029,0.031,0.04,0.011,0.025,0.031,-0.001,-0.008,0.003,0.003,0.005,0.001,0.003
+[CP] GD&T pto de superficie 317- 0,CP,0,0.03,0.03,-0.049,-0.06,-0.059,-0.046,-0.047,-0.053,-0.043,-0.058,-0.043,-0.042,-0.009,-0.021,-0.054,-0.049,-0.062,-0.06,-0.089,-0.058,-0.072,-0.062,-0.067,-0.078,-0.05,-0.094,-0.092,-0.078,-0.057,-0.04,-0.092,0.009,0.003,-0.056,-0.047,-0.056,-0.049,-0.065
+[CP] GD&T pto de superficie 318- 0,CP,0,0.03,0.03,-0.064,-0.078,-0.067,-0.054,-0.044,-0.071,-0.065,-0.075,-0.065,-0.054,-0.01,-0.039,-0.056,-0.039,-0.076,-0.08,-0.105,-0.059,-0.077,-0.061,-0.066,-0.082,-0.041,-0.113,-0.109,-0.093,-0.065,-0.055,-0.109,-0.007,-0.006,-0.058,-0.049,-0.058,-0.044,-0.058
+[CP] GD&T pto de superficie 319- 0,CP,0,0.03,0.03,-0.082,-0.099,-0.081,-0.071,-0.059,-0.091,-0.086,-0.09,-0.086,-0.066,-0.013,-0.067,-0.063,-0.032,-0.096,-0.089,-0.115,-0.073,-0.079,-0.075,-0.075,-0.095,-0.042,-0.121,-0.115,-0.106,-0.076,-0.073,-0.115,-0.029,-0.024,-0.059,-0.046,-0.062,-0.038,-0.048
+[CP] GD&T pto de superficie 320- 0,CP,0,0.03,0.03,-0.058,-0.073,-0.063,-0.052,-0.047,-0.068,-0.06,-0.062,-0.06,-0.033,0.016,-0.048,-0.035,-0.01,-0.069,-0.059,-0.088,-0.053,-0.054,-0.052,-0.045,-0.073,-0.024,-0.094,-0.083,-0.078,-0.065,-0.043,-0.083,-0.006,-0.005,-0.026,-0.015,-0.037,-0.013,-0.019
+[CP] GD&T pto de superficie 321- 0,CP,0,0.03,0.03,-0.018,-0.023,-0.025,-0.014,-0.011,-0.024,-0.02,-0.02,-0.02,0.021,0.062,-0.021,0.011,0.024,-0.021,-0.004,-0.037,-0.019,-0.015,-0.008,0.009,-0.029,0.014,-0.019,-0.015,-0.026,-0.032,0.009,-0.015,0.028,0.032,0.037,0.044,0.01,0.031,0.032
+[CP] GD&T pto de superficie 322- 0,CP,0,0.03,0.03,-0.06,-0.052,-0.016,-0.065,-0.063,-0.06,-0.066,-0.04,-0.066,-0.054,-0.056,-0.077,-0.019,-0.012,-0.042,-0.071,-0.026,-0.051,-0.047,-0.026,-0.038,-0.006,-0.024,-0.05,-0.036,-0.05,-0.039,-0.06,-0.036,-0.092,-0.079,-0.064,-0.079,-0.058,-0.063,-0.052
+[CP] GD&T pto de superficie 323- 0,CP,0,0.03,0.03,-0.04,-0.031,-0.004,-0.057,-0.055,-0.039,-0.045,-0.022,-0.045,-0.046,-0.053,-0.066,-0.02,-0.015,-0.032,-0.067,-0.022,-0.048,-0.048,-0.015,-0.045,-0.007,-0.026,-0.03,-0.037,-0.046,-0.039,-0.053,-0.037,-0.092,-0.076,-0.074,-0.082,-0.062,-0.07,-0.064
+[CP] GD&T pto de superficie 324- 0,CP,0,0.03,0.03,-0.056,-0.046,-0.029,-0.084,-0.067,-0.056,-0.059,-0.046,-0.059,-0.075,-0.089,-0.072,-0.052,-0.037,-0.053,-0.09,-0.049,-0.078,-0.064,-0.051,-0.085,-0.036,-0.058,-0.056,-0.072,-0.069,-0.059,-0.082,-0.072,-0.094,-0.092,-0.101,-0.097,-0.075,-0.087,-0.08
+[CP] GD&T pto de superficie 325- 0,CP,0,0.03,0.03,-0.074,-0.068,-0.043,-0.102,-0.079,-0.075,-0.073,-0.066,-0.073,-0.099,-0.121,-0.079,-0.069,-0.055,-0.073,-0.105,-0.057,-0.093,-0.075,-0.083,-0.11,-0.052,-0.082,-0.071,-0.094,-0.082,-0.063,-0.094,-0.094,-0.093,-0.1,-0.115,-0.111,-0.084,-0.097,-0.09
+[CP] GD&T pto de superficie 326- 0,CP,0,0.03,0.03,-0.028,-0.028,-0.006,-0.041,-0.033,-0.031,-0.023,-0.025,-0.023,-0.052,-0.084,-0.019,-0.025,-0.019,-0.024,-0.053,-0.001,-0.035,-0.024,-0.051,-0.063,-0.016,-0.049,-0.034,-0.049,-0.027,-0.004,-0.038,-0.049,-0.03,-0.039,-0.063,-0.058,-0.018,-0.04,-0.042
+[DVA] LIN 57. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.044,0.041,0.055,0.057,0.058,0.05,0.053,0.048,0.053,0.054,0.048,0.049,0.061,0.056,0.035,0.023,0.041,0.052,0.051,0.059,0.05,0.065,0.061,0.053,0.048,0.057,0.016,0.039,0.048,0.057,0.061,0.063,0.068,0.062,0.068,0.079
+[DVA] LIN 58. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.028,0.034,0.029,0.008,0.024,0.033,0.033,0.005,0.033,0.04,0.043,0.012,0.016,0.033,0.035,0.036,0.039,0.034,0.026,0.009,0.023,0.033,0.022,0.035,0.038,0.02,0.034,0.018,0.038,0.03,0.023,0.041,0.049,0.041,0.041,0.053
+[DVA] LIN 59. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.017,0.022,0.028,0.017,0.012,0.023,0.005,0.024,0.005,0.03,0.03,0.017,0.009,0.025,0.006,0.001,0.021,0.015,0.009,0.073,0.041,0.031,0.044,0.034,0.035,0.022,0.02,0.033,0.035,0.026,0.021,0.007,0.023,0.007,0.019,0.021
+[DVA] LIN 60. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.064,0.075,0.075,0.076,0.076,0.072,0.05,0.037,0.05,0.07,0.053,0.036,0.062,0.071,0.06,0.052,0.067,0.061,0.056,0.045,0.05,0.036,0.058,0.037,0.039,0.033,0.058,0.056,0.039,0.049,0.056,0.063,0.08,0.043,0.066,0.074
+[DVA] LIN 61. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.073,0.078,0.086,0.068,0.069,0.072,0.072,0.071,0.072,0.085,0.084,0.059,0.071,0.081,0.07,0.068,0.072,0.002,0.076,0.08,0.069,0.067,0.069,0.054,0.058,0.052,0.063,0.063,0.058,0.054,0.056,0.06,0.068,0.065,0.061,0.075
+[DVA] LIN 62. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.077,0.071,0.082,0.069,0.071,0.071,0.058,0.065,0.058,0.085,0.085,0.033,0.063,0.076,0.056,0.055,0.055,0.058,0.066,0.075,0.065,0.061,0.066,0.018,0.017,0.026,0.019,0.033,0.017,0,0.02,0.004,0.038,0.024,0.034,0.049
+[DVA] LIN 63. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.015,0.002,0.02,0.028,0.018,0.009,0.014,0.01,0.014,0.001,0.012,0.002,0.008,0.037,0.004,0.004,0.02,0.026,0.023,0.002,0.01,0.013,0.022,0.026,0.011,0.025,0.019,0.021,0.011,0.008,0.022,0.001,0.002,0.015,0.03,0.024
+[DVA] LIN 64. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.003,0.012,0.008,0.04,0.034,0.012,0.006,0,0.006,0.005,0.009,0,0.034,0.04,0.005,0.023,0.002,0.034,0.029,0.003,0,0.004,0.036,0.011,0.007,0.002,0.04,0.022,0.007,0.003,0.02,0.011,0.009,0.013,0.04,0.037
+[DVA] LIN 65. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.037,0.04,0.048,0.042,0.047,0.035,0.044,0.045,0.044,0.039,0.044,0.053,0.05,0.051,0.044,0.042,0.048,0.049,0.049,0.029,0.036,0.037,0.029,0.038,0.035,0.052,0.036,0.021,0.035,0.038,0.038,0.041,0.04,0.05,0.042,0.047
+[DVA] LIN 66. Coplanaridad- 0.06,DVA Apariencia,0.06,0.03,0.03,0.042,0.018,0.067,0.051,0.05,0.032,0.041,0.051,0.041,0.043,0.046,0.038,0.036,0.042,0.046,0.043,0.056,0.05,0.058,0.037,0.042,0.064,0.041,0.024,0.015,0.042,0.038,0.02,0.015,0.032,0.038,0.027,0.034,0.05,0.036,0.041
+[CP] LIN 91. Ancho pata_1- 1.529,CP,1.529,0.025,0.025,1.574,1.575,1.557,1.568,1.585,1.571,1.582,1.583,1.582,1.57,1.537,1.609,1.559,1.578,1.605,1.592,1.579,1.606,1.593,1.585,1.6,1.63,1.592,1.592,1.557,1.56,1.567,1.555,1.557,1.58,1.54,1.564,1.6,1.57,1.549,1.575
+[CP] LIN 92. Ancho pata_2- 1.529,CP,1.529,0.025,0.025,1.609,1.601,1.685,1.628,1.596,1.61,1.624,1.619,1.624,1.622,1.646,1.618,1.612,1.622,1.613,1.602,1.635,1.596,1.568,1.634,1.601,1.588,1.577,1.554,1.593,1.597,1.543,1.6,1.593,1.571,1.568,1.61,1.619,1.618,1.647,1.628
+[CP] LIN 93. Ancho interno Doghouse_1- 32.702,CP,32.702,0.05,0.05,32.492,32.536,32.505,32.484,32.496,32.519,32.554,32.484,32.554,32.415,32.486,32.554,32.523,32.506,32.497,32.493,32.531,32.45,32.512,32.468,32.484,32.463,32.519,32.514,32.549,32.54,32.583,32.548,32.549,32.598,32.579,32.521,32.522,32.541,32.511,32.51
+[CP] LIN 94. Ancho interno Doghouse_2- 32.702,CP,32.702,0.05,0.05,32.548,32.58,32.56,32.547,32.563,32.574,32.57,32.53,32.57,32.49,32.452,32.598,32.555,32.545,32.535,32.542,32.559,32.505,32.553,32.528,32.547,32.518,32.558,32.563,32.514,32.54,32.617,32.585,32.514,32.611,32.602,32.555,32.531,32.561,32.557,32.555
+[CP] LIN 95. Ancho interno Doghouse_3- 32.702,CP,32.702,0.05,0.05,32.649,32.658,32.65,32.632,32.655,32.659,32.665,32.636,32.665,32.63,32.631,32.627,32.655,32.646,32.659,32.651,32.666,32.644,32.676,32.632,32.643,32.612,32.657,32.652,32.681,32.656,32.672,32.666,32.681,32.694,32.687,32.667,32.678,32.662,32.643,32.652
+[CP] LIN 96. Altura interna Doghouse_1- 8.4,CP,8.4,0.015,0.015,8.346,8.34,8.318,8.334,8.306,8.37,8.333,8.339,8.333,8.338,8.332,8.331,8.337,8.304,8.34,8.3,8.349,8.354,8.292,8.307,8.314,8.314,8.312,8.368,8.317,8.329,8.344,8.344,8.317,8.35,8.367,8.334,8.299,8.356,8.36,8.321
+[CP] LIN 97. Altura interna Doghouse_2- 8.4,CP,8.4,0.015,0.015,8.333,8.341,8.296,8.35,8.35,8.345,8.294,8.309,8.294,8.323,8.307,8.304,8.341,8.326,8.302,8.287,8.288,8.299,8.303,8.319,8.319,8.329,8.332,8.298,8.308,8.282,8.346,8.358,8.308,8.309,8.357,8.317,8.32,8.33,8.322,8.321
+[CP] LIN 98. Altura interna Doghouse_3- 8.4,CP,8.4,0.015,0.015,8.309,8.269,8.279,8.287,8.301,8.317,8.313,8.321,8.313,8.305,8.287,8.281,8.292,8.285,8.37,8.345,8.34,8.372,8.335,8.357,8.345,8.318,8.346,8.384,8.361,8.363,8.326,8.273,8.361,8.246,8.245,8.31,8.281,8.299,8.271,8.26
+[CP] LIN 99. Altura interna Doghouse_4- 8.4,CP,8.4,0.015,0.015,8.341,8.36,8.341,8.354,8.361,8.338,8.338,8.326,8.338,8.301,8.308,8.318,8.282,8.268,8.329,8.303,8.316,8.323,8.317,8.349,8.333,8.323,8.317,8.3,8.297,8.322,8.301,8.305,8.297,8.256,8.289,8.321,8.3,8.307,8.283,8.291
+`;
+
+            useEffect(() => {
+                if (embeddedCsvData && embeddedCsvData.trim() !== '') {
+                    Papa.parse(embeddedCsvData, {
+                        complete: (results) => {
+                            try {
+                                const { processedRows, extractedPartInfo } = processData(results.data);
+                                setRawData(processedRows);
+                                setPartInfo(extractedPartInfo);
+                            } catch (e) {
+                                console.error("Error procesando CSV incrustado:", e);
+                            }
+                        },
+                        skipEmptyLines: true
+                    });
+                }
+            }, []);
+
+            if (!rawData) {
+                return (
+                    <div className="min-h-screen flex flex-col items-center justify-center bg-[#008080] text-white font-medium space-y-4">
+                        <div className="text-2xl font-bold">Tablero de Capacidad y Estrategia</div>
+                        <p className="text-teal-100 text-sm">Por favor, pega tus datos CSV en la variable embeddedCsvData dentro del código.</p>
+                    </div>
+                );
+            }
+
+            const activeTargetPpk = getTargetPpk(filterCat);
+            const filteredData = filterCat === 'Todas' ? rawData : rawData.filter(d => (d.categoria || "").toLowerCase() === filterCat.toLowerCase());
+            
+            const extractedCategories = rawData.map(d => d.categoria || 'CP');
+            const categorias = Array.from(new Set(['Todas', 'CP', 'CTQ', 'DVA Apariencia', ...extractedCategories]));
+
+            return (
+                <div className="max-w-[1400px] mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
+                    <div className="glass-panel p-6 rounded-2xl shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
+                        <div>
+                            <h1 className="text-2xl font-black text-slate-800 tracking-tight">Capacidad Homogénea de Proceso</h1>
+                            <p className="text-sm font-medium text-slate-500 mt-1">
+                                {partInfo ? partInfo : 'Análisis Multicavidad / Multimolde'}
+                            </p>
+                        </div>
+                        
+                        <div className="flex flex-col sm:flex-row gap-4 w-full lg:w-auto items-center">
+                            <div className="flex flex-wrap items-center gap-2 bg-slate-50 border border-slate-200 p-1.5 rounded-lg">
+                                {categorias.map(cat => (
+                                    <button 
+                                        key={cat}
+                                        onClick={() => setFilterCat(cat)}
+                                        className={`px-4 py-1.5 text-xs font-bold rounded-md transition-all whitespace-nowrap ${
+                                            filterCat === cat 
+                                            ? 'bg-[#008080] text-white shadow-sm border border-[#006666]' 
+                                            : 'text-slate-500 hover:text-slate-700'
+                                        }`}
+                                    >
+                                        {cat}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 px-2">
+                        <span className="relative flex h-3 w-3">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-300 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-3 w-3 bg-teal-100"></span>
+                        </span>
+                        <span className="text-xs font-bold text-teal-50">
+                            Meta actual (Ppk): <span className="text-white">{activeTargetPpk}</span> {filterCat !== 'Todas' && `(Categoría: ${filterCat})`}
+                        </span>
+                    </div>
+
+                    <div className="border-b border-teal-700 flex gap-6 px-2">
+                        <button 
+                            onClick={() => setActiveTab('resumen')}
+                            className={`pb-3 text-sm font-bold border-b-2 transition-colors ${activeTab === 'resumen' ? 'border-white text-white' : 'border-transparent text-teal-100/70 hover:text-white'}`}
+                        >
+                            Resumen Global
+                        </button>
+                        <button 
+                            onClick={() => setActiveTab('estrategia')}
+                            className={`pb-3 text-sm font-bold border-b-2 transition-colors ${activeTab === 'estrategia' ? 'border-white text-white' : 'border-transparent text-teal-100/70 hover:text-white'}`}
+                        >
+                            Estrategia de Proceso
+                        </button>
+                        <button 
+                            onClick={() => setActiveTab('detalle')}
+                            className={`pb-3 text-sm font-bold border-b-2 transition-colors ${activeTab === 'detalle' ? 'border-white text-white' : 'border-transparent text-teal-100/70 hover:text-white'}`}
+                        >
+                            Análisis Detallado
+                        </button>
+                    </div>
+
+                    <div className="animate-fade-in">
+                        {filteredData.length === 0 ? (
+                            <div className="text-center py-20 text-white/80 font-bold">No hay datos que coincidan con el filtro actual.</div>
+                        ) : (
+                            <>
+                                {activeTab === 'resumen' && <ResumenView data={filteredData} />}
+                                {activeTab === 'estrategia' && <EstrategiaView data={filteredData} activeTargetPpk={activeTargetPpk} />}
+                                {activeTab === 'detalle' && <DetalleView data={filteredData} />}
+                            </>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
