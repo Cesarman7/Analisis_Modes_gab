@@ -691,11 +691,15 @@
                                 </div>
                                 <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100">
                                     <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wide">Tol. Actuales</p>
-                                    <p className="text-lg font-bold text-slate-600">+/- {(item.actRango / 2).toFixed(3)}</p>
+                                    <p className="text-base lg:text-lg font-bold text-slate-600">
+                                        {item.isGDTUnilateral ? `+${(item.usl - item.espec).toFixed(3)} / -0.000` : `+/- ${(item.actRango / 2).toFixed(3)}`}
+                                    </p>
                                 </div>
                                 <div className="bg-purple-50 p-2.5 rounded-xl border border-purple-100 shadow-sm">
                                     <p className="text-[10px] text-purple-600 font-bold uppercase tracking-wide">Tol. Propuestas</p>
-                                    <p className="text-lg font-black text-purple-700">+/- {(item.propRango / 2).toFixed(3)}</p>
+                                    <p className="text-base lg:text-lg font-black text-purple-700">
+                                        {item.isGDTUnilateral ? `+${(item.propUsl - item.espec).toFixed(3)} / -0.000` : `+/- ${(item.propRango / 2).toFixed(3)}`}
+                                    </p>
                                 </div>
                             </div>
                             <div className="mt-3 flex items-center gap-4 text-xs font-medium text-slate-500">
